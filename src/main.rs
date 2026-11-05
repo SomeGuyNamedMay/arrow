@@ -1,92 +1,83 @@
-//! A basic Lisp (Scheme-like) interpreter in Rust, split into modules:
-//!
-//!   - `value`    the core `Value` enum shared by every stage
-//!   - `env`      lexical environments (variable scopes)
-//!   - `lexer`    source text -> tokens
-//!   - `parser`   tokens -> `Value` trees (s-expressions)
-//!   - `eval`     special forms + function application
-//!   - `builtins` primitive procedures and the global environment
-//!
-//! Build:   cargo build --release
-//! Run:     cargo run                 (starts a REPL)
-//!          cargo run -- somefile.lisp (runs a file, then starts a REPL)
+mod components;
 
-mod builtins;
-mod env;
-mod eval;
-mod lexer;
-mod parser;
-mod value;
+use components::vertico::Vertico;
+use components::text_editor::{Mode, Message, TextEditor};
+use iced::widget::{column, container, text};
+use iced::{Element, Subscription, keyboard, Task};
 
-use std::fs;
-use std::io::{self, Write};
-
-use env::Env;
-use value::Value;
-
-fn run_source(src: &str, env: &Env) {
-    match parser::parse_all(src) {
-        Ok(exprs) => {
-            for e in exprs {
-                if let Err(err) = eval::eval(&e, env) {
-                    eprintln!("Error: {}", err);
-                }
-            }
-        }
-        Err(e) => eprintln!("Parse error: {}", e),
-    }
+struct Arrow {
+    editor: TextEditor,
+    menu: Vertico,
 }
 
-fn repl(env: &Env) {
-    println!("Basic Lisp interpreter (Rust). Type (exit) or Ctrl-D to quit.");
-    let stdin = io::stdin();
-    loop {
-        print!("lisp> ");
-        io::stdout().flush().ok();
-        let mut line = String::new();
-        let bytes = stdin.read_line(&mut line).unwrap_or(0);
-        if bytes == 0 {
-            println!();
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed == "(exit)" {
-            break;
-        }
-        match parser::parse_all(trimmed) {
-            Ok(exprs) => {
-                for e in exprs {
-                    match eval::eval(&e, env) {
-                        Ok(v) => {
-                            if !matches!(v, Value::Nil) {
-                                println!("{}", v);
-                            }
-                        }
-                        Err(err) => println!("Error: {}", err),
-                    }
-                }
-            }
-            Err(err) => println!("Parse error: {}", err),
+impl Default for Arrow {
+    fn default() -> Self {
+        Self {
+            editor: TextEditor::default().with_text(
+                "Welcome to Arrow.\n\nPress i to insert and Escape to return to normal mode.",
+            ),
+            menu: Vertico::default(),
         }
     }
 }
 
-fn main() {
-    let env = builtins::global_env();
+#[derive(Debug, Clone)]
+enum AppMessage {
+    Editor(Message),
+    Key { key: keyboard::Key, text: Option<String> },
+}
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 {
-        match fs::read_to_string(&args[1]) {
-            Ok(src) => run_source(&src, &env),
-            Err(e) => {
-                eprintln!("Could not read file {}: {}", args[1], e);
-                return;
+fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
+    match message {
+        AppMessage::Editor(message) => app.editor.update(message),
+        AppMessage::Key { key, text } => {
+            if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Tab)) {
+                app.menu.toggle();
+            } else if app.menu.visible && app.menu.update_key(&key, text.as_deref()) {
+                // Vertico owns navigation and minibuffer input.
+            } else {
+                app.editor.update(Message::Key { key, text });
             }
         }
     }
+    Task::none()
+}
 
-    repl(&env);
+fn subscription(_app: &Arrow) -> Subscription<AppMessage> {
+    keyboard::listen().map(|event| {
+        let keyboard::Event::KeyPressed { key, text, .. } = event else {
+            return AppMessage::Key {
+                key: keyboard::Key::Unidentified,
+                text: None,
+            };
+        };
+
+        AppMessage::Key {
+            key,
+            text: text.map(|text| text.to_string()),
+        }
+    })
+}
+
+fn view(app: &Arrow) -> Element<'_, AppMessage> {
+    let mode = match app.editor.mode {
+        Mode::Normal => "NORMAL",
+        Mode::Insert => "INSERT",
+    };
+
+    column![
+        container(app.editor.view().map(AppMessage::Editor)).height(iced::Length::Fill),
+        app.menu.view().map(|_| unreachable!()),
+        text(format!("{mode} | h j k l move | x select line | i insert | c change | d delete"))
+            .font(iced::Font::MONOSPACE),
+    ]
+    .height(iced::Length::Fill)
+    .into()
+}
+
+fn main() -> iced::Result {
+    iced::application(Arrow::default, update, view)
+        .subscription(subscription)
+        .title("Arrow - Kakoune Text Editor")
+        .run()
 }
