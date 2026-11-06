@@ -1,13 +1,15 @@
 mod components;
 
+use components::file_explorer::FileExplorer;
+use components::text_editor::{Message, Mode, TextEditor};
 use components::vertico::Vertico;
-use components::text_editor::{Mode, Message, TextEditor};
 use iced::widget::{column, container, text};
-use iced::{Element, Subscription, keyboard, Task};
+use iced::{Element, Subscription, Task, keyboard};
 
 struct Arrow {
     editor: TextEditor,
     menu: Vertico,
+    explorer: FileExplorer,
 }
 
 impl Default for Arrow {
@@ -17,6 +19,7 @@ impl Default for Arrow {
                 "Welcome to Arrow.\n\nPress i to insert and Escape to return to normal mode.",
             ),
             menu: Vertico::default(),
+            explorer: FileExplorer::default(),
         }
     }
 }
@@ -24,15 +27,38 @@ impl Default for Arrow {
 #[derive(Debug, Clone)]
 enum AppMessage {
     Editor(Message),
-    Key { key: keyboard::Key, text: Option<String> },
+    Key {
+        key: keyboard::Key,
+        text: Option<String>,
+    },
 }
 
 fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
     match message {
         AppMessage::Editor(message) => app.editor.update(message),
         AppMessage::Key { key, text } => {
-            if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Tab)) {
+            if matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::Tab)
+            ) {
                 app.menu.toggle();
+            } else if app.explorer.visible && app.explorer.update_key(&key) {
+                // The file explorer owns navigation while open.
+            } else if app.editor.mode == Mode::Normal
+                && matches!(key.as_ref(), keyboard::Key::Character(character) if character == "e")
+            {
+                app.explorer.toggle();
+            } else if app.editor.mode == Mode::Normal
+                && matches!(
+                    key.as_ref(),
+                    keyboard::Key::Named(keyboard::key::Named::Space)
+                )
+                || app.editor.mode == Mode::Normal
+                    && matches!(key.as_ref(), keyboard::Key::Character(character) if character == " ")
+            {
+                if !app.menu.visible {
+                    app.menu.toggle();
+                }
             } else if app.menu.visible && app.menu.update_key(&key, text.as_deref()) {
                 // Vertico owns navigation and minibuffer input.
             } else {
@@ -67,9 +93,12 @@ fn view(app: &Arrow) -> Element<'_, AppMessage> {
 
     column![
         container(app.editor.view().map(AppMessage::Editor)).height(iced::Length::Fill),
+        app.explorer.view().map(|_| unreachable!()),
         app.menu.view().map(|_| unreachable!()),
-        text(format!("{mode} | h j k l move | x select line | i insert | c change | d delete"))
-            .font(iced::Font::MONOSPACE),
+        text(format!(
+            "{mode} | Space command menu | e file explorer | h j k l move | x select line | i insert | c add cursor below | , keep first cursor | d delete"
+        ))
+        .font(iced::Font::MONOSPACE),
     ]
     .height(iced::Length::Fill)
     .into()

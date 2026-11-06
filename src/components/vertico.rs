@@ -1,5 +1,5 @@
 use iced::keyboard;
-use iced::widget::{column, container, rule, row, text};
+use iced::widget::{column, container, row, rule, text};
 use iced::{Color, Element, Length, Padding};
 
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub struct Vertico {
 impl Default for Vertico {
     fn default() -> Self {
         Self {
-            visible: true,
+            visible: false,
             query: String::new(),
             selected: 0,
             candidates: vec![
@@ -87,7 +87,9 @@ impl Vertico {
                 }
 
                 let mut haystack = candidate.chars().flat_map(char::to_lowercase);
-                query.chars().all(|needle| haystack.any(|character| character == needle))
+                query
+                    .chars()
+                    .all(|needle| haystack.any(|character| character == needle))
             })
             .map(String::as_str)
             .collect()
@@ -117,37 +119,35 @@ impl Vertico {
             let marker = if selected { ">" } else { " " };
 
             let candidate_row = row![
-                text(marker).font(iced::Font::MONOSPACE).width(Length::Fixed(18.0)),
-                text(*candidate).font(iced::Font::MONOSPACE).width(Length::Fill),
+                text(marker)
+                    .font(iced::Font::MONOSPACE)
+                    .width(Length::Fixed(18.0)),
+                text(*candidate)
+                    .font(iced::Font::MONOSPACE)
+                    .width(Length::Fill),
             ]
             .padding(Padding::from([1, 8]));
 
-            candidates = candidates.push(
-                container(candidate_row)
-                    .width(Length::Fill)
-                    .style(move |theme: &iced::Theme| {
-                        let palette = theme.palette();
-                        container::Style {
-                            background: selected.then(|| {
-                                Color::from_rgb(0.20, 0.35, 0.55).into()
-                            }),
-                            text_color: Some(if selected {
-                                Color::WHITE
-                            } else {
-                                palette.text
-                            }),
-                            border: iced::Border::default(),
-                            shadow: iced::Shadow::default(),
-                            snap: false,
-                        }
-                    }),
-            );
+            candidates = candidates.push(container(candidate_row).width(Length::Fill).style(
+                move |theme: &iced::Theme| {
+                    let palette = theme.palette();
+                    container::Style {
+                        background: selected.then(|| Color::from_rgb(0.20, 0.35, 0.55).into()),
+                        text_color: Some(if selected { Color::WHITE } else { palette.text }),
+                        border: iced::Border::default(),
+                        shadow: iced::Shadow::default(),
+                        snap: false,
+                    }
+                },
+            ));
         }
 
         column![
             rule::horizontal(1),
             container(row![
-                text("M-x").font(iced::Font::MONOSPACE).width(Length::Fixed(38.0)),
+                text("M-x")
+                    .font(iced::Font::MONOSPACE)
+                    .width(Length::Fixed(38.0)),
                 text(if self.query.is_empty() {
                     "_"
                 } else {
@@ -185,10 +185,7 @@ mod tests {
         let mut vertico = Vertico::default();
         vertico.selected = 4;
 
-        assert!(vertico.update_key(
-            &keyboard::Key::Character("f".into()),
-            Some("f"),
-        ));
+        assert!(vertico.update_key(&keyboard::Key::Character("f".into()), Some("f"),));
         assert_eq!(vertico.query, "f");
         assert_eq!(vertico.selected, 0);
     }
@@ -210,10 +207,7 @@ mod tests {
         vertico.query = "file".into();
         vertico.selected = 3;
 
-        assert!(vertico.update_key(
-            &keyboard::Key::Named(keyboard::key::Named::Backspace),
-            None,
-        ));
+        assert!(vertico.update_key(&keyboard::Key::Named(keyboard::key::Named::Backspace), None,));
         assert_eq!(vertico.query, "fil");
         assert_eq!(vertico.selected, 0);
     }
@@ -222,10 +216,7 @@ mod tests {
     fn escape_hides_vertico() {
         let mut vertico = Vertico::default();
 
-        assert!(vertico.update_key(
-            &keyboard::Key::Named(keyboard::key::Named::Escape),
-            None,
-        ));
+        assert!(vertico.update_key(&keyboard::Key::Named(keyboard::key::Named::Escape), None,));
         assert!(!vertico.visible);
     }
 
@@ -236,11 +227,11 @@ mod tests {
         vertico.selected = 2;
 
         vertico.toggle();
-        assert!(!vertico.visible);
+        assert!(vertico.visible);
         assert!(vertico.query.is_empty());
         assert_eq!(vertico.selected, 0);
 
         vertico.toggle();
-        assert!(vertico.visible);
+        assert!(!vertico.visible);
     }
 }
