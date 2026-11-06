@@ -22,3 +22,14 @@ def list_directory():
 def default_python_commands():
     for name in sorted(arrow.commands):
         print(name)
+
+
+@arrow.command("open-readme")
+def open_readme():
+    arrow.open_file("README.md")
+
+
+@arrow.command("write-output-file")
+def write_output_file():
+    arrow.write_file("arrow-output.txt", "Written by Arrow's Python scripting system.\n")
+    print("Wrote arrow-output.txt")

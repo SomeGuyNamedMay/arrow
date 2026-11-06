@@ -110,6 +110,13 @@ fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
                         if let Err(error) = python.execute(&command) {
                             eprintln!("{error}");
                         }
+                        for action in PythonRuntime::take_actions() {
+                            match action {
+                                components::python::PythonAction::OpenBuffer(contents) => {
+                                    app.editor = TextEditor::default().with_text(contents);
+                                }
+                            }
+                        }
                     }
                 }
             } else if app.menu.visible && app.menu.update_key(&key, text.as_deref()) {

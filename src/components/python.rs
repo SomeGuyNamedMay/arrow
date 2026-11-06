@@ -1,7 +1,17 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::CString;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonAction {
+    OpenBuffer(String),
+}
+
+thread_local! {
+    static PYTHON_ACTIONS: RefCell<Vec<PythonAction>> = const { RefCell::new(Vec::new()) };
+}
 
 const ARROW_PYTHON_API: &str = r#"
 commands = {}
@@ -22,12 +32,46 @@ def hook(name):
 "#;
 const DEFAULT_COMMANDS: &str = include_str!("../../python/default_commands.py");
 
+#[pyfunction]
+fn open_file(path: &str) -> PyResult<String> {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("Could not open '{path}': {error}"))
+    })?;
+    PYTHON_ACTIONS.with(|actions| {
+        actions
+            .borrow_mut()
+            .push(PythonAction::OpenBuffer(contents.clone()));
+    });
+    Ok(contents)
+}
+
+#[pyfunction]
+fn write_file(path: &str, contents: &str) -> PyResult<()> {
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                "Could not create directory '{}': {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    std::fs::write(path, contents).map_err(|error| {
+        PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("Could not write '{path}': {error}"))
+    })
+}
+
 pub struct PythonRuntime {
     module: Py<PyModule>,
     commands: BTreeMap<String, String>,
 }
 
 impl PythonRuntime {
+    pub fn take_actions() -> Vec<PythonAction> {
+        PYTHON_ACTIONS.with(|actions| std::mem::take(&mut *actions.borrow_mut()))
+    }
+
     pub fn new() -> Result<Self, String> {
         Python::attach(|py| {
             let code = CString::new(ARROW_PYTHON_API).unwrap();
@@ -44,6 +88,12 @@ impl PythonRuntime {
             modules
                 .set_item("arrow", module.clone())
                 .map_err(|error| format!("Failed to register Arrow Python module: {error}"))?;
+            module
+                .add_function(wrap_pyfunction!(open_file, py).unwrap())
+                .map_err(|error| format!("Failed to register open_file: {error}"))?;
+            module
+                .add_function(wrap_pyfunction!(write_file, py).unwrap())
+                .map_err(|error| format!("Failed to register write_file: {error}"))?;
 
             let default_commands = CString::new(DEFAULT_COMMANDS).unwrap();
             py.run(default_commands.as_c_str(), Some(&module.dict()), None)
@@ -177,5 +227,7 @@ mod tests {
         assert!(names.contains(&"current-directory".to_string()));
         assert!(names.contains(&"list-directory".to_string()));
         assert!(names.contains(&"default-python-commands".to_string()));
+        assert!(names.contains(&"open-readme".to_string()));
+        assert!(names.contains(&"write-output-file".to_string()));
     }
 }
