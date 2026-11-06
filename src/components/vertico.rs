@@ -16,20 +16,21 @@ impl Default for Vertico {
             visible: false,
             query: String::new(),
             selected: 0,
-            candidates: vec![
-                "open-file".into(),
-                "save-buffer".into(),
-                "switch-buffer".into(),
-                "find-file".into(),
-                "execute-command".into(),
-                "grep-project".into(),
-                "list-buffers".into(),
-            ],
+            candidates: Vec::new(),
         }
     }
 }
 
 impl Vertico {
+    pub fn replace_candidates(&mut self, candidates: Vec<String>) {
+        self.candidates = candidates;
+        self.selected = 0;
+        self.query.clear();
+    }
+
+    pub fn selected_candidate(&self) -> Option<&str> {
+        self.filtered().get(self.selected).copied()
+    }
     pub fn update_key(&mut self, key: &keyboard::Key, text: Option<&str>) -> bool {
         match key.as_ref() {
             keyboard::Key::Named(keyboard::key::Named::Escape) => {
@@ -172,6 +173,11 @@ mod tests {
     #[test]
     fn filters_candidates_with_a_fuzzy_query() {
         let mut vertico = Vertico::default();
+        vertico.replace_candidates(vec![
+            "save-buffer".into(),
+            "switch-buffer".into(),
+            "list-buffers".into(),
+        ]);
         vertico.query = "sf".into();
 
         assert_eq!(
@@ -193,6 +199,7 @@ mod tests {
     #[test]
     fn selection_navigation_wraps() {
         let mut vertico = Vertico::default();
+        vertico.replace_candidates(vec!["save-buffer".into(), "switch-buffer".into()]);
 
         vertico.move_selection(-1);
         assert_eq!(vertico.selected, vertico.filtered().len() - 1);
@@ -233,5 +240,14 @@ mod tests {
 
         vertico.toggle();
         assert!(!vertico.visible);
+    }
+
+    #[test]
+    fn selected_candidate_reports_the_current_result() {
+        let mut vertico = Vertico::default();
+        vertico.replace_candidates(vec!["about-arrow".into(), "current-directory".into()]);
+        vertico.query = "current".into();
+
+        assert_eq!(vertico.selected_candidate(), Some("current-directory"));
     }
 }

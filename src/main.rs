@@ -1,25 +1,47 @@
 mod components;
 
 use components::file_explorer::FileExplorer;
+use components::python::PythonRuntime;
 use components::text_editor::{Message, Mode, TextEditor};
 use components::vertico::Vertico;
-use iced::widget::{column, container, text};
+use iced::widget::{column, container};
 use iced::{Element, Subscription, Task, keyboard};
 
 struct Arrow {
     editor: TextEditor,
     menu: Vertico,
     explorer: FileExplorer,
+    python: Option<PythonRuntime>,
 }
 
 impl Default for Arrow {
     fn default() -> Self {
+        let python = match PythonRuntime::new() {
+            Ok(python) => Some(python),
+            Err(error) => {
+                eprintln!("Python scripting disabled: {error}");
+                None
+            }
+        };
+        if let Some(python) = &python
+            && let Err(error) = python.run_hook("startup")
+        {
+            eprintln!("{error}");
+        }
+        let mut menu = Vertico::default();
+        if let Some(python) = &python {
+            let mut commands = python.command_names();
+            commands.sort();
+            commands.dedup();
+            menu.replace_candidates(commands);
+        }
         Self {
             editor: TextEditor::default().with_text(
                 "Welcome to Arrow.\n\nPress i to insert and Escape to return to normal mode.",
             ),
-            menu: Vertico::default(),
+            menu,
             explorer: FileExplorer::default(),
+            python,
         }
     }
 }
@@ -79,6 +101,17 @@ fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
                 if !app.menu.visible {
                     app.menu.toggle();
                 }
+            } else if app.menu.visible && is_enter(&key) {
+                if let Some(command) = app.menu.selected_candidate().map(str::to_string) {
+                    app.menu.visible = false;
+                    if let Some(python) = &app.python
+                        && python.has_command(&command)
+                    {
+                        if let Err(error) = python.execute(&command) {
+                            eprintln!("{error}");
+                        }
+                    }
+                }
             } else if app.menu.visible && app.menu.update_key(&key, text.as_deref()) {
                 // Vertico owns navigation and minibuffer input.
             } else {
@@ -106,19 +139,10 @@ fn subscription(_app: &Arrow) -> Subscription<AppMessage> {
 }
 
 fn view(app: &Arrow) -> Element<'_, AppMessage> {
-    let mode = match app.editor.mode {
-        Mode::Normal => "NORMAL",
-        Mode::Insert => "INSERT",
-    };
-
     column![
-        container(app.editor.view().map(AppMessage::Editor)).height(iced::Length::Fill),
         app.explorer.view().map(|_| unreachable!()),
+        container(app.editor.view().map(AppMessage::Editor)).height(iced::Length::Fill),
         app.menu.view().map(|_| unreachable!()),
-        text(format!(
-            "{mode} | Space command menu | e file explorer | h j k l move | x select line | i insert | c add cursor below | , keep first cursor | d delete"
-        ))
-        .font(iced::Font::MONOSPACE),
     ]
     .height(iced::Length::Fill)
     .into()

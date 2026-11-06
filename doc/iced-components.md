@@ -163,6 +163,36 @@ pub mod file_explorer;
 The application imports types and messages from these modules in
 `src/main.rs`, then wires them into the shared application update loop.
 
+## Python scripting (`src/components/python.rs`)
+
+Arrow embeds Python through PyO3 and loads Emacs-style commands and hooks from
+`init.py`. On Windows, this file is read from `%APPDATA%\Arrow\init.py`; on
+other platforms it is read from `$XDG_CONFIG_HOME/arrow/init.py`, or
+`~/.config/arrow/init.py` when `XDG_CONFIG_HOME` is unset.
+
+Commands are registered by decorating functions in Python:
+
+```python
+import arrow
+
+@arrow.command()
+def greet_user():
+    print("Hello from Arrow")
+
+@arrow.command("open-project-notes")
+def open_project_notes():
+    print("Project notes command")
+
+@arrow.hook("startup")
+def startup():
+    print("Arrow Python configuration loaded")
+```
+
+The decorator name becomes `greet-user` when no explicit name is supplied.
+Python commands are added to the Vertico command menu and execute when Enter is
+pressed on the selected entry. Startup hooks run once after `init.py` is loaded.
+Python exceptions are reported in the application stderr and do not stop Arrow.
+
 ## File explorer (`src/components/file_explorer.rs`)
 
 `FileExplorer` is a ranger-style component organized into parent, current, and
