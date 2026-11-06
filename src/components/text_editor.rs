@@ -2,6 +2,7 @@ use iced::advanced::text::{Paragraph, Renderer as TextRenderer, Text};
 use iced::keyboard;
 use iced::widget::canvas::{self, Canvas, Geometry};
 use iced::{Color, Element, Length, Point, Rectangle, Renderer, Theme, mouse};
+use ropey::Rope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -19,7 +20,7 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub struct TextEditor {
-    pub buffer: String,
+    pub buffer: Rope,
     pub cursor: usize,
     pub cursors: Vec<usize>,
     pub anchors: Vec<Option<usize>>,
@@ -54,7 +55,7 @@ where
 impl Default for TextEditor {
     fn default() -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Rope::new(),
             cursor: 0,
             cursors: vec![0],
             anchors: vec![None],
@@ -66,8 +67,23 @@ impl Default for TextEditor {
 }
 
 impl TextEditor {
+    fn chars(&self) -> Vec<char> {
+        self.buffer.chars().collect()
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.buffer
+            .lines()
+            .map(|line| line.to_string().trim_end_matches('\n').to_string())
+            .collect()
+    }
+
+    fn text_range(&self, start: usize, end: usize) -> String {
+        self.buffer.slice(start..end).to_string()
+    }
+
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
-        self.buffer = text.into();
+        self.buffer = Rope::from_str(&text.into());
         self.cursor = 0;
         self.cursors = vec![0];
         self.anchor = None;
@@ -117,7 +133,7 @@ impl TextEditor {
                 "a" => {
                     self.anchor = None;
                     self.anchors.fill(None);
-                    let count = self.buffer.chars().count();
+                    let count = self.buffer.len_chars();
                     self.cursors = self
                         .cursors
                         .iter()
@@ -132,7 +148,7 @@ impl TextEditor {
                     let (_, column) = self.position();
                     let (_, bottom_row) =
                         self.position_at(*self.cursors.last().unwrap_or(&self.cursor));
-                    let lines: Vec<&str> = self.buffer.split('\n').collect();
+                    let lines = self.lines();
                     let bottom_row = if self.cursors.len() > 1 {
                         bottom_row
                     } else {
@@ -188,7 +204,7 @@ impl TextEditor {
     }
 
     fn char_count(&self) -> usize {
-        self.buffer.chars().count()
+        self.buffer.len_chars()
     }
 
     fn insert_char(&mut self, character: char) {
@@ -199,8 +215,7 @@ impl TextEditor {
         insertions.dedup();
 
         for &position in insertions.iter().rev() {
-            let byte = self.byte_index(position);
-            self.buffer.insert(byte, character);
+            self.buffer.insert(position, &character.to_string());
         }
 
         let mut transformed = Vec::with_capacity(positions.len());
@@ -236,8 +251,7 @@ impl TextEditor {
         }
 
         for range in ranges.iter().rev() {
-            self.buffer
-                .replace_range(self.byte_index(range.start)..self.byte_index(range.end), "");
+            self.buffer.remove(range.clone());
         }
         self.cursors = self
             .cursors
@@ -274,14 +288,6 @@ impl TextEditor {
         self.cursors.dedup();
     }
 
-    fn byte_index(&self, char_index: usize) -> usize {
-        self.buffer
-            .char_indices()
-            .nth(char_index)
-            .map(|(index, _)| index)
-            .unwrap_or(self.buffer.len())
-    }
-
     fn position(&self) -> (usize, usize) {
         self.position_at(self.cursor)
     }
@@ -314,7 +320,7 @@ impl TextEditor {
     }
 
     fn move_vertical(&mut self, delta: isize) {
-        let lines: Vec<&str> = self.buffer.split('\n').collect();
+        let lines = self.lines();
         let old_cursors = self.cursors.clone();
         self.cursors = old_cursors
             .iter()
@@ -342,7 +348,7 @@ impl TextEditor {
     }
 
     fn move_to_next_word(&mut self) {
-        let chars: Vec<char> = self.buffer.chars().collect();
+        let chars = self.chars();
         self.cursors = self
             .cursors
             .iter()
@@ -367,7 +373,7 @@ impl TextEditor {
     }
 
     fn move_to_previous_word(&mut self) {
-        let chars: Vec<char> = self.buffer.chars().collect();
+        let chars = self.chars();
         self.cursors = self
             .cursors
             .iter()
@@ -392,7 +398,7 @@ impl TextEditor {
     }
 
     fn select_line(&mut self) {
-        let lines: Vec<&str> = self.buffer.split('\n').collect();
+        let lines = self.lines();
         let old_cursors = self.cursors.clone();
         let mut selections = Vec::new();
         for cursor in old_cursors {
@@ -442,7 +448,7 @@ impl TextEditor {
     fn delete_selection_or_character(&mut self) {
         if self.selected_range().is_some() {
             self.delete_selection();
-        } else if !self.buffer.is_empty() {
+        } else if self.buffer.len_chars() != 0 {
             let mut ranges = self
                 .cursors
                 .iter()
@@ -457,12 +463,11 @@ impl TextEditor {
             }
 
             let first = ranges[0].clone();
-            let start = self.byte_index(first.start);
-            let end = self.byte_index(first.end);
-            self.yank = self.buffer[start..end].to_string();
+            let start = first.start;
+            let end = first.end;
+            self.yank = self.text_range(start, end);
             for range in ranges.iter().rev() {
-                self.buffer
-                    .replace_range(self.byte_index(range.start)..self.byte_index(range.end), "");
+                self.buffer.remove(range.clone());
             }
 
             self.cursors = self
@@ -511,12 +516,9 @@ impl TextEditor {
         ranges.dedup();
 
         let (start, end) = ranges[0];
-        let start_byte = self.byte_index(start);
-        let end_byte = self.byte_index(end);
-        self.yank = self.buffer[start_byte..end_byte].to_string();
+        self.yank = self.text_range(start, end);
         for &(start, end) in ranges.iter().rev() {
-            self.buffer
-                .replace_range(self.byte_index(start)..self.byte_index(end), "");
+            self.buffer.remove(start..end);
         }
 
         self.cursors = self
@@ -548,8 +550,8 @@ impl TextEditor {
         let positions = self.cursors.clone();
         let inserted_count = self.yank.chars().count();
         for &cursor in positions.iter().rev() {
-            let byte = self.byte_index((cursor + 1).min(self.char_count()));
-            self.buffer.insert_str(byte, &self.yank);
+            let position = (cursor + 1).min(self.char_count());
+            self.buffer.insert(position, &self.yank);
         }
         self.cursors = positions
             .iter()
@@ -592,7 +594,7 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
             Color::from_rgb(0.06, 0.07, 0.09),
         );
 
-        let lines: Vec<&str> = self.editor.buffer.split('\n').collect();
+        let lines = self.editor.lines();
         let mut line_start = 0;
 
         for (row, line) in lines.iter().enumerate() {
@@ -638,7 +640,7 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
 
         for &cursor in &self.editor.cursors {
             let (row, column) = self.editor.position_at(cursor);
-            let line = lines.get(row).copied().unwrap_or_default();
+            let line = lines.get(row).map(String::as_str).unwrap_or_default();
             let prefix: String = line.chars().take(column).collect();
             let cursor_x = if prefix.is_empty() {
                 TEXT_X
@@ -657,7 +659,7 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
         }
 
         let (row, column) = self.editor.position();
-        let line = lines.get(row).copied().unwrap_or_default();
+        let line = lines.get(row).map(String::as_str).unwrap_or_default();
         let prefix: String = line.chars().take(column).collect();
         let cursor_x = if prefix.is_empty() {
             TEXT_X
@@ -688,7 +690,7 @@ mod tests {
             key: keyboard::Key::Character("a".into()),
             text: Some("a".into()),
         });
-        assert_eq!(editor.buffer, "a");
+        assert_eq!(editor.buffer.to_string(), "a");
         assert_eq!(editor.cursor, 1);
     }
 
@@ -714,7 +716,7 @@ mod tests {
             key: keyboard::Key::Character("d".into()),
             text: Some("d".into()),
         });
-        assert_eq!(editor.buffer, "\ntwo");
+        assert_eq!(editor.buffer.to_string(), "\ntwo");
     }
 
     #[test]
@@ -767,7 +769,7 @@ mod tests {
             text: Some("x".into()),
         });
 
-        assert_eq!(editor.buffer, "xone\nxtwo");
+        assert_eq!(editor.buffer.to_string(), "xone\nxtwo");
         assert_eq!(editor.cursors, vec![1, 6]);
     }
 
@@ -782,6 +784,6 @@ mod tests {
             text: Some("d".into()),
         });
 
-        assert_eq!(editor.buffer, "ne wo");
+        assert_eq!(editor.buffer.to_string(), "ne wo");
     }
 }

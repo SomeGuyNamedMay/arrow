@@ -66,6 +66,13 @@ impl FileExplorer {
         }
     }
 
+    pub fn selected_file(&self) -> Option<PathBuf> {
+        self.entries
+            .get(self.selected)
+            .filter(|path| !path.is_dir())
+            .cloned()
+    }
+
     pub fn update_key(&mut self, key: &keyboard::Key) -> bool {
         match key.as_ref() {
             keyboard::Key::Named(keyboard::key::Named::Escape) => {
@@ -251,5 +258,25 @@ mod tests {
         assert_eq!(explorer.selected, 1);
         explorer.move_selection(1);
         assert_eq!(explorer.selected, 0);
+    }
+
+    #[test]
+    fn selected_file_returns_only_files() {
+        let temp_directory =
+            std::env::temp_dir().join(format!("arrow-file-explorer-{}", std::process::id()));
+        let file = temp_directory.join("selected.txt");
+        fs::create_dir_all(&temp_directory).unwrap();
+        fs::write(&file, "contents").unwrap();
+
+        let mut explorer = FileExplorer::default();
+        explorer.entries = vec![temp_directory.clone(), file.clone()];
+        explorer.selected = 0;
+        assert_eq!(explorer.selected_file(), None);
+
+        explorer.selected = 1;
+        assert_eq!(explorer.selected_file(), Some(file.clone()));
+
+        fs::remove_file(file).unwrap();
+        fs::remove_dir(temp_directory).unwrap();
     }
 }

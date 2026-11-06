@@ -33,6 +33,13 @@ enum AppMessage {
     },
 }
 
+fn is_enter(key: &keyboard::Key) -> bool {
+    matches!(
+        key.as_ref(),
+        keyboard::Key::Named(keyboard::key::Named::Enter)
+    )
+}
+
 fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
     match message {
         AppMessage::Editor(message) => app.editor.update(message),
@@ -44,6 +51,19 @@ fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
                 app.menu.toggle();
             } else if app.explorer.visible && app.explorer.update_key(&key) {
                 // The file explorer owns navigation while open.
+                if is_enter(&key)
+                    && let Some(path) = app.explorer.selected_file()
+                {
+                    match std::fs::read_to_string(&path) {
+                        Ok(contents) => {
+                            app.editor = TextEditor::default().with_text(contents);
+                            app.explorer.visible = false;
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to open {}: {error}", path.display());
+                        }
+                    }
+                }
             } else if app.editor.mode == Mode::Normal
                 && matches!(key.as_ref(), keyboard::Key::Character(character) if character == "e")
             {
