@@ -38,6 +38,7 @@ arrow.register_language(
     arrow.builtin_highlights_query("rust"),
     ("function_item", "function_signature_item"),
     CAPTURE_COLORS,
+    {"command": "rust-analyzer", "args": [], "root_markers": ["Cargo.toml"]},
 )
 
 arrow.register_language(
@@ -47,4 +48,5 @@ arrow.register_language(
     arrow.builtin_highlights_query("python"),
     ("function_definition",),
     CAPTURE_COLORS,
+    {"command": "pyright-langserver", "args": ["--stdio"], "root_markers": ["pyproject.toml", "setup.py", "pyrightconfig.json"]},
 )

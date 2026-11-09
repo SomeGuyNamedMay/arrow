@@ -69,7 +69,20 @@ pub(super) fn apply_python_actions(app: &mut Arrow) {
                         .unwrap_or_default()
                         .to_vec();
                     app.vertico.visible = false;
-                    if let Some(python) = &app.python {
+                    if action == "lsp-completion" {
+                        if let [start, end, text] = arguments.as_slice() {
+                            match (start.parse::<usize>(), end.parse::<usize>()) {
+                                (Ok(start), Ok(end)) => {
+                                    app.editor.apply_completion(start, end, text)
+                                }
+                                (Err(error), _) | (_, Err(error)) => {
+                                    eprintln!("Invalid LSP completion range: {error}");
+                                }
+                            }
+                        } else {
+                            eprintln!("LSP completion item has an invalid argument list");
+                        }
+                    } else if let Some(python) = &app.python {
                         if let Err(error) = python.execute_with_args(&action, &arguments) {
                             eprintln!("{error}");
                         }
@@ -96,10 +109,37 @@ fn configure_syntax(app: &mut Arrow, path: &std::path::Path) {
         },
         None => Vec::new(),
     };
-    if let Err(error) = app.editor.set_syntax_languages(languages) {
+    if let Err(error) = app.editor.set_syntax_languages(languages.clone()) {
         eprintln!("Invalid syntax configuration: {error}");
         return;
     }
+    app.lsp_generation = app.lsp_generation.wrapping_add(1);
+    app.lsp = None;
+    app.lsp_version = 0;
+    app.lsp_text.clear();
+    app.completion_pending = false;
+    app.lsp_path = Some(path.to_path_buf());
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    app.lsp_config = languages.into_iter().find_map(|language| {
+        language
+            .extensions
+            .iter()
+            .any(|candidate| {
+                candidate
+                    .trim_start_matches('.')
+                    .eq_ignore_ascii_case(&extension)
+            })
+            .then(|| {
+                language
+                    .completion_server
+                    .map(|server| (language.name, server))
+            })
+            .flatten()
+    });
     if let Err(error) = app.editor.set_file_path(path) {
         eprintln!("{error}");
     }
@@ -121,4 +161,20 @@ pub(super) fn execute_python(app: &mut Arrow, command: &str) {
         eprintln!("{error}");
     }
     apply_python_actions(app);
+    sync_lsp_document(app);
+}
+
+pub(super) fn sync_lsp_document(app: &mut Arrow) {
+    let text = app.editor.buffer.to_string();
+    if text == app.lsp_text {
+        return;
+    }
+    if let Some(lsp) = &app.lsp {
+        app.lsp_version = app.lsp_version.saturating_add(1);
+        if let Err(error) = lsp.did_change(app.lsp_version, &text) {
+            eprintln!("{error}");
+        } else {
+            app.lsp_text = text;
+        }
+    }
 }

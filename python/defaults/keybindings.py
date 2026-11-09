@@ -245,14 +245,6 @@ def clear_selection_command():
     })
 
 
-@arrow.command("insert-newline")
-def insert_newline_command():
-    arrow.replace_ranges([
-        (dot["cursor"], dot["cursor"], "\n")
-        for dot in arrow.dots()
-    ])
-
-
 @arrow.command("backspace")
 def backspace_command():
     ranges = []
@@ -324,7 +316,6 @@ NORMAL_BINDINGS = {
 
 INSERT_BINDINGS = {
     "escape": "normal-mode",
-    "enter": "insert-newline",
     "backspace": "backspace",
 }
 

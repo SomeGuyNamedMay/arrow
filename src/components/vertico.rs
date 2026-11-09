@@ -51,6 +51,13 @@ impl Vertico {
         self.query.clear();
     }
 
+    pub fn replace_items_with_title(&mut self, title: &str, items: Vec<VerticoItem>) {
+        self.title = title.to_string();
+        self.prompt.clear();
+        self.replace_items(items);
+        self.visible = !self.candidates.is_empty();
+    }
+
     pub fn selected_arguments(&self) -> Option<&[String]> {
         let candidate_index = {
             let filtered: Vec<_> = self.filtered();

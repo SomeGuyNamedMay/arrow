@@ -1,6 +1,6 @@
 use super::api;
 use super::{PYTHON_ACTIONS, PythonAction};
-use crate::components::syntax::SyntaxLanguageConfig;
+use crate::components::syntax::{CompletionServerConfig, SyntaxLanguageConfig};
 use crate::components::text_editor::Dot;
 use iced::Color;
 use pyo3::prelude::*;
@@ -169,6 +169,44 @@ impl PythonRuntime {
                     let name = get_string("name")?;
                     let grammar = get_string("grammar")?;
                     let highlights_query = get_string("highlights_query")?;
+                    let completion_server = language
+                        .get_item("completion_server")
+                        .map_err(|error| error.to_string())?
+                        .filter(|value| !value.is_none())
+                        .map(|value| {
+                            let server = value
+                                .cast_into::<PyDict>()
+                                .map_err(|error| format!("Language '{name}' completion_server must be a dictionary: {error}"))?;
+                            let Some(command_value) = server
+                                .get_item("command")
+                                .map_err(|error| error.to_string())?
+                            else {
+                                return Err(format!("Language '{name}' completion server is missing 'command'"));
+                            };
+                            let command = command_value
+                                .extract::<String>()
+                                .map_err(|error| format!("Language '{name}' completion server command must be a string: {error}"))?;
+                            let arguments = server
+                                .get_item("args")
+                                .map_err(|error| error.to_string())?
+                                .map(|value| value.extract::<Vec<String>>())
+                                .transpose()
+                                .map_err(|error| format!("Language '{name}' completion server args must be strings: {error}"))?
+                                .unwrap_or_default();
+                            let root_markers = server
+                                .get_item("root_markers")
+                                .map_err(|error| error.to_string())?
+                                .map(|value| value.extract::<Vec<String>>())
+                                .transpose()
+                                .map_err(|error| format!("Language '{name}' root markers must be strings: {error}"))?
+                                .unwrap_or_default();
+                            Ok::<_, String>(CompletionServerConfig {
+                                command,
+                                arguments,
+                                root_markers,
+                            })
+                        })
+                        .transpose()?;
                     let extensions = language
                         .get_item("extensions")
                         .map_err(|error| error.to_string())?
@@ -215,6 +253,7 @@ impl PythonRuntime {
                         highlights_query,
                         function_nodes,
                         capture_colors,
+                        completion_server,
                     })
                 })
                 .collect()
@@ -354,9 +393,14 @@ mod tests {
             runtime.command_for_key("insert", "escape"),
             Some("normal-mode".to_string())
         );
+        assert_eq!(runtime.command_for_key("insert", "enter"), None);
         assert_eq!(
             runtime.command_for_key("normal", "f"),
             Some("select-function".to_string())
+        );
+        assert_eq!(
+            runtime.command_for_key("vertico", "tab"),
+            Some("vertico-down".to_string())
         );
 
         runtime.execute("insert-mode").unwrap();
@@ -377,6 +421,10 @@ mod tests {
                 && language.grammar == "rust"
                 && language.extensions == ["rs"]
                 && language
+                    .completion_server
+                    .as_ref()
+                    .is_some_and(|server| server.command == "rust-analyzer")
+                && language
                     .function_nodes
                     .contains(&"function_item".to_string())
                 && !language.capture_colors.is_empty()
@@ -385,6 +433,9 @@ mod tests {
             language.name == "python"
                 && language.grammar == "python"
                 && language.extensions == ["py", "pyi"]
+                && language.completion_server.as_ref().is_some_and(|server| {
+                    server.command == "pyright-langserver" && server.arguments == ["--stdio"]
+                })
                 && language
                     .function_nodes
                     .contains(&"function_definition".to_string())

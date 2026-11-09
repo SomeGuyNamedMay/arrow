@@ -28,8 +28,14 @@ pub struct SelectionRange {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Key { key: keyboard::Key },
-    ScrollBy { delta: f32, viewport_height: f32 },
+    Key {
+        key: keyboard::Key,
+        text: Option<String>,
+    },
+    ScrollBy {
+        delta: f32,
+        viewport_height: f32,
+    },
     ScrollFrame,
 }
 
@@ -176,6 +182,20 @@ impl TextEditor {
         self.ensure_focused_dots_visible();
     }
 
+    pub fn apply_completion(&mut self, start: usize, end: usize, text: &str) {
+        let Some(focused_index) = self.dots.iter().position(|dot| dot.is_focused) else {
+            return;
+        };
+        let start = start.min(self.char_count());
+        let end = end.min(self.char_count()).max(start);
+        self.replace_ranges(&[(start, end, text.to_string())]);
+        if let Some(dot) = self.dots.get_mut(focused_index) {
+            dot.cursor = start + text.chars().count();
+            dot.selection = None;
+        }
+        self.ensure_focused_dots_visible();
+    }
+
     fn refresh_syntax(&mut self) {
         if let Err(error) = self.syntax.reparse(&self.buffer.to_string()) {
             eprintln!("{error}");
@@ -202,19 +222,27 @@ impl TextEditor {
                 }
                 return;
             }
-            Message::Key { key } => self.update_key(key),
+            Message::Key { key, text } => self.update_key(key, text),
         }
     }
 
-    fn update_key(&mut self, key: keyboard::Key) {
+    fn update_key(&mut self, key: keyboard::Key, text: Option<String>) {
         if self.mode == Mode::Insert {
-            match key.as_ref() {
-                keyboard::Key::Character(character) => {
-                    for character in character.chars() {
-                        self.insert_char(character);
-                    }
+            if matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::Enter)
+            ) {
+                self.insert_char('\n');
+                return;
+            }
+            let text = text.or_else(|| match key.as_ref() {
+                keyboard::Key::Character(character) => Some(character.to_string()),
+                _ => None,
+            });
+            if let Some(text) = text {
+                for character in text.chars().filter(|character| !character.is_control()) {
+                    self.insert_char(character);
                 }
-                _ => {}
             }
             return;
         }
@@ -508,12 +536,26 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
             };
             frame.fill_rectangle(
                 Point::new(cursor_x, TEXT_Y + row as f32 * LINE_HEIGHT - scroll_offset),
-                iced::Size::new(character_width::<Renderer>("M"), LINE_HEIGHT - 2.0),
+                iced::Size::new(
+                    cursor_width::<Renderer>(self.editor.mode),
+                    LINE_HEIGHT - 2.0,
+                ),
                 dot_color(self.editor.mode, dot.is_focused),
             );
         }
 
         vec![frame.into_geometry()]
+    }
+}
+
+fn cursor_width<ParagraphRenderer>(mode: Mode) -> f32
+where
+    ParagraphRenderer: TextRenderer<Font = iced::Font>,
+    ParagraphRenderer::Paragraph: Paragraph<Font = ParagraphRenderer::Font>,
+{
+    match mode {
+        Mode::Normal => character_width::<ParagraphRenderer>("M"),
+        Mode::Insert => 2.0,
     }
 }
 
@@ -537,9 +579,43 @@ mod tests {
         editor.mode = Mode::Insert;
         editor.update(Message::Key {
             key: keyboard::Key::Character("a".into()),
+            text: None,
         });
         assert_eq!(editor.buffer.to_string(), "a");
         assert_eq!(editor.dots()[0].cursor, 1);
+    }
+
+    #[test]
+    fn insert_mode_uses_shifted_text_from_the_keyboard_event() {
+        let mut editor = TextEditor::default();
+        editor.mode = Mode::Insert;
+        editor.update(Message::Key {
+            key: keyboard::Key::Character("0".into()),
+            text: Some(")".into()),
+        });
+
+        assert_eq!(editor.buffer.to_string(), ")");
+        assert_eq!(editor.dots()[0].cursor, 1);
+    }
+
+    #[test]
+    fn enter_in_insert_mode_inserts_newline_and_moves_cursor_to_next_line() {
+        let mut editor = TextEditor::default().with_text("ab");
+        editor.set_dots(&[Dot {
+            cursor: 1,
+            selection: None,
+            is_focused: true,
+        }]);
+        editor.mode = Mode::Insert;
+
+        editor.update(Message::Key {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            text: None,
+        });
+
+        assert_eq!(editor.buffer.to_string(), "a\nb");
+        assert_eq!(editor.dots()[0].cursor, 2);
+        assert_eq!(editor.position_at(editor.dots()[0].cursor), (1, 0));
     }
 
     #[test]
@@ -549,6 +625,12 @@ mod tests {
         assert_eq!(dot_color(Mode::Insert, true), blue);
         assert_ne!(dot_color(Mode::Normal, false), blue);
         assert_ne!(dot_color(Mode::Insert, false), blue);
+    }
+
+    #[test]
+    fn insert_mode_uses_a_thin_cursor_bar() {
+        assert_eq!(cursor_width::<Renderer>(Mode::Insert), 2.0);
+        assert!(cursor_width::<Renderer>(Mode::Normal) > 2.0);
     }
 
     #[test]
@@ -695,6 +777,31 @@ mod tests {
     }
 
     #[test]
+    fn applying_completion_replaces_range_and_moves_focused_dot() {
+        let mut editor = TextEditor::default().with_text("let pri");
+        editor.set_dots(&[
+            Dot {
+                cursor: 7,
+                selection: None,
+                is_focused: true,
+            },
+            Dot {
+                cursor: 3,
+                selection: None,
+                is_focused: false,
+            },
+        ]);
+
+        editor.apply_completion(4, 7, "print");
+
+        assert_eq!(editor.buffer.to_string(), "let print");
+        let dots = editor.dots();
+        assert_eq!(dots[0].cursor, 9);
+        assert_eq!(dots[0].selection, None);
+        assert_eq!(dots[1].cursor, 3);
+    }
+
+    #[test]
     fn selection_color_matches_its_dot_color() {
         let mut editor = TextEditor::default().with_text("one\ntwo");
         editor.set_dots(&[
@@ -762,6 +869,7 @@ mod tests {
 
         editor.update(Message::Key {
             key: keyboard::Key::Character("x".into()),
+            text: None,
         });
 
         assert_eq!(editor.buffer.to_string(), "xone\nxtwo");

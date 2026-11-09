@@ -41,6 +41,7 @@ VERTICO_BINDINGS = {
     "escape": "close-vertico",
     "up": "vertico-up",
     "down": "vertico-down",
+    "tab": "vertico-down",
     "backspace": "vertico-backspace",
     "enter": "execute-vertico",
 }

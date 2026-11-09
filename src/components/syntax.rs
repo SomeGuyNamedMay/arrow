@@ -12,6 +12,14 @@ pub(crate) struct SyntaxLanguageConfig {
     pub(crate) highlights_query: String,
     pub(crate) function_nodes: Vec<String>,
     pub(crate) capture_colors: BTreeMap<String, (Color, u8)>,
+    pub(crate) completion_server: Option<CompletionServerConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionServerConfig {
+    pub(crate) command: String,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) root_markers: Vec<String>,
 }
 
 fn grammar_language(grammar: &str) -> Result<Language, String> {
@@ -249,6 +257,7 @@ mod tests {
                     "function_signature_item".to_string(),
                 ],
                 capture_colors: colors.clone(),
+                completion_server: None,
             },
             SyntaxLanguageConfig {
                 name: "python".to_string(),
@@ -257,6 +266,7 @@ mod tests {
                 highlights_query: tree_sitter_python::HIGHLIGHTS_QUERY.to_string(),
                 function_nodes: vec!["function_definition".to_string()],
                 capture_colors: colors,
+                completion_server: None,
             },
         ]
     }

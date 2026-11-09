@@ -28,12 +28,13 @@ def keybinding(key, command, mode="normal"):
     bind_key(key, command, mode)
 
 def register_language(name, grammar, extensions, highlights_query,
-                      function_nodes=(), capture_colors=None):
+                      function_nodes=(), capture_colors=None, completion_server=None):
     """Register a compiled grammar's extensions, queries, and highlight styles.
 
     Capture colors map query names to (red, green, blue, priority), with color
     channels between 0.0 and 1.0. Grammar identifiers select parsers compiled
     into Arrow; see builtin_highlights_query for available bundled queries.
+    completion_server may contain command, args, and root_markers.
     """
     syntax_languages[name] = {
         "name": name,
@@ -42,6 +43,7 @@ def register_language(name, grammar, extensions, highlights_query,
         "highlights_query": highlights_query,
         "function_nodes": tuple(function_nodes),
         "capture_colors": dict(capture_colors or {}),
+        "completion_server": completion_server,
     }
 
 def dots():
