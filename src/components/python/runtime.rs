@@ -1,6 +1,8 @@
 use super::api;
 use super::{PYTHON_ACTIONS, PythonAction};
+use crate::components::syntax::SyntaxLanguageConfig;
 use crate::components::text_editor::Dot;
+use iced::Color;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
 use std::collections::BTreeMap;
@@ -10,6 +12,7 @@ use std::sync::Mutex;
 static PYTHON_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 const DEFAULT_COMMANDS: &str = include_str!("../../../python/defaults/commands.py");
+const DEFAULT_SYNTAX: &str = include_str!("../../../python/defaults/syntax.py");
 const DEFAULT_VERTICO: &str = include_str!("../../../python/defaults/vertico.py");
 const DEFAULT_KEYBINDINGS: &str = include_str!("../../../python/defaults/keybindings.py");
 
@@ -52,6 +55,15 @@ impl PythonRuntime {
                         |traceback| traceback.format().unwrap_or_default(),
                     );
                     format!("Failed to load default Python commands: {error}\n{traceback}")
+                })?;
+            let default_syntax = CString::new(DEFAULT_SYNTAX).unwrap();
+            py.run(default_syntax.as_c_str(), Some(&module.dict()), None)
+                .map_err(|error| {
+                    let traceback = error.traceback(py).map_or_else(
+                        || String::new(),
+                        |traceback| traceback.format().unwrap_or_default(),
+                    );
+                    format!("Failed to load default syntax configuration: {error}\n{traceback}")
                 })?;
             let default_vertico = CString::new(DEFAULT_VERTICO).unwrap();
             py.run(default_vertico.as_c_str(), Some(&module.dict()), None)
@@ -127,6 +139,86 @@ impl PythonRuntime {
     pub fn set_editor_text(&self, text: &str) -> Result<(), String> {
         super::EDITOR_TEXT.with(|stored| *stored.borrow_mut() = text.to_string());
         Ok(())
+    }
+
+    pub fn syntax_languages(&self) -> Result<Vec<SyntaxLanguageConfig>, String> {
+        Python::attach(|py| {
+            let module = self.module.bind(py);
+            let languages = module
+                .getattr("syntax_languages")
+                .map_err(|error| format!("Python syntax_languages must be a dictionary: {error}"))?
+                .cast_into::<PyDict>()
+                .map_err(|error| {
+                    format!("Python syntax_languages must be a dictionary: {error}")
+                })?;
+
+            languages
+                .iter()
+                .map(|(_, value)| {
+                    let language = value
+                        .cast::<PyDict>()
+                        .map_err(|error| format!("Invalid Python language definition: {error}"))?;
+                    let get_string = |key: &str| -> Result<String, String> {
+                        language
+                            .get_item(key)
+                            .map_err(|error| error.to_string())?
+                            .ok_or_else(|| format!("Language definition is missing '{key}'"))?
+                            .extract::<String>()
+                            .map_err(|error| format!("Language field '{key}' must be a string: {error}"))
+                    };
+                    let name = get_string("name")?;
+                    let grammar = get_string("grammar")?;
+                    let highlights_query = get_string("highlights_query")?;
+                    let extensions = language
+                        .get_item("extensions")
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("Language '{name}' is missing 'extensions'"))?
+                        .extract::<Vec<String>>()
+                        .map_err(|error| format!("Language '{name}' extensions must be strings: {error}"))?;
+                    let function_nodes = language
+                        .get_item("function_nodes")
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("Language '{name}' is missing 'function_nodes'"))?
+                        .extract::<Vec<String>>()
+                        .map_err(|error| format!("Language '{name}' function_nodes must be strings: {error}"))?;
+                    let colors = language
+                        .get_item("capture_colors")
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("Language '{name}' is missing 'capture_colors'"))?
+                        .cast_into::<PyDict>()
+                        .map_err(|error| format!("Language '{name}' capture_colors must be a dictionary: {error}"))?;
+                    let mut capture_colors = std::collections::BTreeMap::new();
+                    for (capture, value) in colors.iter() {
+                        let capture = capture
+                            .extract::<String>()
+                            .map_err(|error| format!("Language '{name}' capture name must be a string: {error}"))?;
+                        let values = value
+                            .cast::<PyTuple>()
+                            .map_err(|error| format!("Color for capture '{capture}' must be a tuple: {error}"))?;
+                        if values.len() != 4 {
+                            return Err(format!("Color for capture '{capture}' must contain red, green, blue, and priority"));
+                        }
+                        let red = values.get_item(0).and_then(|item| item.extract::<f32>())
+                            .map_err(|error| format!("Invalid red channel for capture '{capture}': {error}"))?;
+                        let green = values.get_item(1).and_then(|item| item.extract::<f32>())
+                            .map_err(|error| format!("Invalid green channel for capture '{capture}': {error}"))?;
+                        let blue = values.get_item(2).and_then(|item| item.extract::<f32>())
+                            .map_err(|error| format!("Invalid blue channel for capture '{capture}': {error}"))?;
+                        let priority = values.get_item(3).and_then(|item| item.extract::<u8>())
+                            .map_err(|error| format!("Invalid priority for capture '{capture}': {error}"))?;
+                        capture_colors.insert(capture, (Color::from_rgb(red, green, blue), priority));
+                    }
+                    Ok(SyntaxLanguageConfig {
+                        name,
+                        grammar,
+                        extensions,
+                        highlights_query,
+                        function_nodes,
+                        capture_colors,
+                    })
+                })
+                .collect()
+        })
     }
 
     pub fn command_for_key(&self, mode: &str, key: &str) -> Option<String> {
@@ -262,11 +354,75 @@ mod tests {
             runtime.command_for_key("insert", "escape"),
             Some("normal-mode".to_string())
         );
+        assert_eq!(
+            runtime.command_for_key("normal", "f"),
+            Some("select-function".to_string())
+        );
 
         runtime.execute("insert-mode").unwrap();
         assert_eq!(
             PythonRuntime::take_actions(),
             vec![PythonAction::EnterInsertMode]
+        );
+    }
+
+    #[test]
+    fn default_python_syntax_configuration_registers_rust_and_python() {
+        let runtime = PythonRuntime::new().unwrap();
+        let languages = runtime.syntax_languages().unwrap();
+
+        assert_eq!(languages.len(), 2);
+        assert!(languages.iter().any(|language| {
+            language.name == "rust"
+                && language.grammar == "rust"
+                && language.extensions == ["rs"]
+                && language
+                    .function_nodes
+                    .contains(&"function_item".to_string())
+                && !language.capture_colors.is_empty()
+        }));
+        assert!(languages.iter().any(|language| {
+            language.name == "python"
+                && language.grammar == "python"
+                && language.extensions == ["py", "pyi"]
+                && language
+                    .function_nodes
+                    .contains(&"function_definition".to_string())
+        }));
+    }
+
+    #[test]
+    fn python_can_register_language_extensions_and_syntax_queries() {
+        let runtime = PythonRuntime::new().unwrap();
+        Python::attach(|py| {
+            let module = runtime.module.bind(py);
+            let source = CString::new(
+                "register_language('rust-test', 'rust', ('rsx',), \
+                 builtin_highlights_query('rust'), ('function_item',), {})",
+            )
+            .unwrap();
+            py.run(source.as_c_str(), Some(&module.dict()), None)
+                .unwrap();
+        });
+
+        let languages = runtime.syntax_languages().unwrap();
+        let custom = languages
+            .iter()
+            .find(|language| language.name == "rust-test")
+            .unwrap();
+        assert_eq!(custom.grammar, "rust");
+        assert_eq!(custom.extensions, ["rsx"]);
+        assert!(custom.function_nodes.contains(&"function_item".to_string()));
+    }
+
+    #[test]
+    fn select_function_command_requests_editor_text_object_selection() {
+        let runtime = PythonRuntime::new().unwrap();
+        runtime.execute("select-function").unwrap();
+
+        assert_eq!(
+            PythonRuntime::take_actions(),
+            vec![PythonAction::SelectFunction]
         );
     }
 
@@ -315,6 +471,7 @@ mod tests {
             "move-right",
             "move-next-word",
             "move-previous-word",
+            "select-function",
             "select-line",
             "append-mode",
             "add-cursor-below",

@@ -126,6 +126,11 @@ def focus_next_dot_command():
     focus_adjacent_dot(1)
 
 
+@arrow.command("select-function")
+def select_function_command():
+    arrow.select_function()
+
+
 @arrow.command("move-next-word")
 def move_next_word_command():
     text = arrow.text()
@@ -305,6 +310,7 @@ NORMAL_BINDINGS = {
     "right": "move-right",
     "[": "focus-previous-dot",
     "]": "focus-next-dot",
+    "f": "select-function",
     "w": "move-next-word",
     "b": "move-previous-word",
     "x": "select-line",

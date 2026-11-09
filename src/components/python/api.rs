@@ -7,6 +7,7 @@ pub(super) const ARROW_PYTHON_API: &str = r#"
 commands = {}
 hooks = {}
 keybindings = {}
+syntax_languages = {}
 
 def command(name=None):
     def register(function):
@@ -25,6 +26,23 @@ def bind_key(key, command, mode="normal"):
     keybindings.setdefault(mode, {})[key] = command
 def keybinding(key, command, mode="normal"):
     bind_key(key, command, mode)
+
+def register_language(name, grammar, extensions, highlights_query,
+                      function_nodes=(), capture_colors=None):
+    """Register a compiled grammar's extensions, queries, and highlight styles.
+
+    Capture colors map query names to (red, green, blue, priority), with color
+    channels between 0.0 and 1.0. Grammar identifiers select parsers compiled
+    into Arrow; see builtin_highlights_query for available bundled queries.
+    """
+    syntax_languages[name] = {
+        "name": name,
+        "grammar": grammar,
+        "extensions": tuple(extensions),
+        "highlights_query": highlights_query,
+        "function_nodes": tuple(function_nodes),
+        "capture_colors": dict(capture_colors or {}),
+    }
 
 def dots():
     return _editor_dots.copy()
@@ -105,9 +123,10 @@ fn open_file(path: &str) -> PyResult<String> {
         PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("Could not open '{path}': {error}"))
     })?;
     PYTHON_ACTIONS.with(|actions| {
-        actions
-            .borrow_mut()
-            .push(PythonAction::OpenBuffer(contents.clone()));
+        actions.borrow_mut().push(PythonAction::OpenBuffer {
+            contents: contents.clone(),
+            path: path.to_string(),
+        });
     });
     Ok(contents)
 }
@@ -170,6 +189,17 @@ fn run_command(name: &str) {
             .borrow_mut()
             .push(PythonAction::ExecuteCommand(name.to_string()));
     });
+}
+
+#[pyfunction]
+fn builtin_highlights_query(grammar: &str) -> PyResult<&'static str> {
+    match grammar {
+        "rust" => Ok(tree_sitter_rust::HIGHLIGHTS_QUERY),
+        "python" => Ok(tree_sitter_python::HIGHLIGHTS_QUERY),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "No built-in grammar named '{grammar}'"
+        ))),
+    }
 }
 
 #[pyfunction]
@@ -243,6 +273,7 @@ queue_action!(
     PythonAction::ExplorerActivateSelected
 );
 queue_action!(execute_vertico, PythonAction::ExecuteVertico);
+queue_action!(select_function, PythonAction::SelectFunction);
 
 pub(super) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> Result<(), String> {
     module
@@ -275,6 +306,9 @@ pub(super) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> Result<(
     module
         .add_function(wrap_pyfunction!(replace_ranges, py).unwrap())
         .map_err(|error| format!("Failed to register replace_ranges: {error}"))?;
+    module
+        .add_function(wrap_pyfunction!(builtin_highlights_query, py).unwrap())
+        .map_err(|error| format!("Failed to register builtin_highlights_query: {error}"))?;
     module.setattr("_editor_dots", PyList::empty(py)).unwrap();
     for function in [
         wrap_pyfunction!(close_file_explorer, py).unwrap(),
@@ -288,6 +322,7 @@ pub(super) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> Result<(
         wrap_pyfunction!(vertico_backspace, py).unwrap(),
         wrap_pyfunction!(explorer_activate_selected, py).unwrap(),
         wrap_pyfunction!(execute_vertico, py).unwrap(),
+        wrap_pyfunction!(select_function, py).unwrap(),
     ] {
         module
             .add_function(function)

@@ -8,7 +8,10 @@ use std::cell::RefCell;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PythonAction {
-    OpenBuffer(String),
+    OpenBuffer {
+        contents: String,
+        path: String,
+    },
     EnterInsertMode,
     LeaveInsertMode,
     ReplaceRanges(Vec<(usize, usize, String)>),
@@ -32,6 +35,7 @@ pub enum PythonAction {
     ExecuteVertico,
     ExecuteCommand(String),
     ReplaceDots(Vec<Dot>),
+    SelectFunction,
 }
 
 thread_local! {

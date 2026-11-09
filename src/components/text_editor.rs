@@ -3,6 +3,9 @@ use iced::keyboard;
 use iced::widget::canvas::{self, Canvas, Geometry};
 use iced::{Color, Element, Length, Point, Rectangle, Renderer, Theme, mouse};
 use ropey::Rope;
+use std::path::Path;
+
+use super::syntax::{SyntaxLanguageConfig, SyntaxState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -30,10 +33,10 @@ pub enum Message {
     ScrollFrame,
 }
 
-#[derive(Debug, Clone)]
 pub struct TextEditor {
     pub buffer: Rope,
     dots: Vec<Dot>,
+    syntax: SyntaxState,
     pub mode: Mode,
     scroll_y: f32,
     scroll_target_y: f32,
@@ -67,6 +70,7 @@ impl Default for TextEditor {
     fn default() -> Self {
         Self {
             buffer: Rope::new(),
+            syntax: SyntaxState::default(),
             dots: vec![Dot {
                 cursor: 0,
                 selection: None,
@@ -97,6 +101,7 @@ impl TextEditor {
             self.buffer.remove(start..end);
             self.buffer.insert(start, &replacement);
         }
+        self.refresh_syntax();
         self.dots = self
             .dots
             .iter()
@@ -136,6 +141,7 @@ impl TextEditor {
 
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         self.buffer = Rope::from_str(&text.into());
+        self.refresh_syntax();
         self.dots = vec![Dot {
             cursor: 0,
             selection: None,
@@ -144,6 +150,36 @@ impl TextEditor {
         self.scroll_y = 0.0;
         self.scroll_target_y = 0.0;
         self
+    }
+
+    pub fn set_file_path(&mut self, path: &Path) -> Result<(), String> {
+        self.syntax.set_file_path(path, &self.buffer.to_string())
+    }
+
+    pub fn set_syntax_languages(
+        &mut self,
+        languages: Vec<SyntaxLanguageConfig>,
+    ) -> Result<(), String> {
+        self.syntax.set_languages(languages)
+    }
+
+    pub fn select_function_at_focused_dots(&mut self) {
+        for dot in &mut self.dots {
+            if !dot.is_focused {
+                continue;
+            }
+            if let Some((start, end)) = self.syntax.enclosing_function(&self.buffer, dot.cursor) {
+                dot.cursor = end.saturating_sub(1);
+                dot.selection = Some(SelectionRange { start, end });
+            }
+        }
+        self.ensure_focused_dots_visible();
+    }
+
+    fn refresh_syntax(&mut self) {
+        if let Err(error) = self.syntax.reparse(&self.buffer.to_string()) {
+            eprintln!("{error}");
+        }
     }
 
     pub fn update(&mut self, message: Message) {
@@ -291,6 +327,7 @@ impl TextEditor {
             }
         }
         self.dots = merged;
+        self.refresh_syntax();
         self.ensure_focused_dots_visible();
     }
 
@@ -414,13 +451,47 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
                 }
             }
 
-            let mut text = canvas::Text::default();
-            text.content = format!("{line}");
-            text.position = Point::new(12.0, y);
-            text.color = Color::from_rgb(0.88, 0.89, 0.92);
-            text.size = iced::Pixels(16.0);
-            text.font = iced::Font::MONOSPACE;
-            frame.fill_text(text);
+            let line_start_byte = self.editor.buffer.line_to_byte(row);
+            let line_end_byte = line_start_byte + line.len();
+            let mut boundaries = vec![0, line.len()];
+            let line_spans = self
+                .editor
+                .syntax
+                .line_highlights(row)
+                .iter()
+                .filter_map(|span| {
+                    let start = span.start_byte.max(line_start_byte);
+                    let end = span.end_byte.min(line_end_byte);
+                    (start < end).then_some((start - line_start_byte, end - line_start_byte, *span))
+                })
+                .collect::<Vec<_>>();
+            for (start, end, _) in &line_spans {
+                boundaries.push(*start);
+                boundaries.push(*end);
+            }
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            let mut x = TEXT_X;
+            for range in boundaries.windows(2) {
+                let (start, end) = (range[0], range[1]);
+                if start == end {
+                    continue;
+                }
+                let segment = &line[start..end];
+                let color = line_spans
+                    .iter()
+                    .filter(|(span_start, span_end, _)| *span_start <= start && *span_end >= end)
+                    .max_by_key(|(_, _, span)| span.priority)
+                    .map_or(Color::from_rgb(0.88, 0.89, 0.92), |(_, _, span)| span.color);
+                let mut text = canvas::Text::default();
+                text.content = segment.to_string();
+                text.position = Point::new(x, y);
+                text.color = color;
+                text.size = iced::Pixels(16.0);
+                text.font = iced::Font::MONOSPACE;
+                frame.fill_text(text);
+                x += character_width::<Renderer>(segment);
+            }
         }
 
         for dot in &self.editor.dots {
@@ -587,6 +658,40 @@ mod tests {
 
         editor.replace_ranges(&[(0, 3, String::new())]);
         assert_eq!(editor.buffer.to_string(), "\ntwo");
+    }
+
+    #[test]
+    fn select_function_selects_only_at_focused_dots() {
+        let source = "fn first() {}\nfn second() { let x = 1; }\n";
+        let mut editor = TextEditor::default().with_text(source);
+        let python = crate::components::python::PythonRuntime::new().unwrap();
+        editor
+            .set_syntax_languages(python.syntax_languages().unwrap())
+            .unwrap();
+        editor.set_file_path(Path::new("example.rs")).unwrap();
+        editor.set_dots(&[
+            Dot {
+                cursor: source.find("let x").unwrap(),
+                selection: None,
+                is_focused: true,
+            },
+            Dot {
+                cursor: source.find("first").unwrap(),
+                selection: None,
+                is_focused: false,
+            },
+        ]);
+
+        editor.select_function_at_focused_dots();
+        let dots = editor.dots();
+        let selection = dots[0].selection.unwrap();
+        assert!(
+            source[editor.buffer.char_to_byte(selection.start)
+                ..editor.buffer.char_to_byte(selection.end)]
+                .starts_with("fn second()")
+        );
+        assert!(dots[0].cursor >= selection.start && dots[0].cursor < selection.end);
+        assert_eq!(dots[1].selection, None);
     }
 
     #[test]

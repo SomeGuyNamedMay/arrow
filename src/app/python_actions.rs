@@ -6,8 +6,9 @@ use crate::components::vertico::VerticoItem;
 pub(super) fn apply_python_actions(app: &mut Arrow) {
     for action in PythonRuntime::take_actions() {
         match action {
-            PythonAction::OpenBuffer(contents) => {
+            PythonAction::OpenBuffer { contents, path } => {
                 app.editor = TextEditor::default().with_text(contents);
+                configure_syntax(app, std::path::Path::new(&path));
             }
             PythonAction::EnterInsertMode => {
                 app.editor.mode = Mode::Insert;
@@ -51,6 +52,7 @@ pub(super) fn apply_python_actions(app: &mut Arrow) {
                     match std::fs::read_to_string(&path) {
                         Ok(contents) => {
                             app.editor = TextEditor::default().with_text(contents);
+                            configure_syntax(app, &path);
                             app.explorer.visible = false;
                         }
                         Err(error) => eprintln!("Failed to open {}: {error}", path.display()),
@@ -78,7 +80,28 @@ pub(super) fn apply_python_actions(app: &mut Arrow) {
                 execute_python(app, &command);
             }
             PythonAction::ReplaceDots(dots) => app.editor.set_dots(&dots),
+            PythonAction::SelectFunction => app.editor.select_function_at_focused_dots(),
         }
+    }
+}
+
+fn configure_syntax(app: &mut Arrow, path: &std::path::Path) {
+    let languages = match &app.python {
+        Some(python) => match python.syntax_languages() {
+            Ok(languages) => languages,
+            Err(error) => {
+                eprintln!("Failed to load Python syntax configuration: {error}");
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+    if let Err(error) = app.editor.set_syntax_languages(languages) {
+        eprintln!("Invalid syntax configuration: {error}");
+        return;
+    }
+    if let Err(error) = app.editor.set_file_path(path) {
+        eprintln!("{error}");
     }
 }
 
