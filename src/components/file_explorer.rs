@@ -1,4 +1,3 @@
-use iced::keyboard;
 use iced::widget::{column, container, row, text};
 use iced::{Color, Element, Length};
 use std::fs;
@@ -73,50 +72,20 @@ impl FileExplorer {
             .cloned()
     }
 
-    pub fn update_key(&mut self, key: &keyboard::Key) -> bool {
-        match key.as_ref() {
-            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                self.visible = false;
-                true
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                self.move_selection(-1);
-                true
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                self.move_selection(1);
-                true
-            }
-            keyboard::Key::Character(character) => match character.as_ref() {
-                "k" => {
-                    self.move_selection(-1);
-                    true
-                }
-                "j" => {
-                    self.move_selection(1);
-                    true
-                }
-                "h" => {
-                    self.parent_directory();
-                    true
-                }
-                "l" => {
-                    self.open_selected();
-                    true
-                }
-                _ => false,
-            },
-            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                self.parent_directory();
-                true
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowRight)
-            | keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                self.open_selected();
-                true
-            }
-            _ => false,
-        }
+    pub fn select_previous(&mut self) {
+        self.move_selection(-1);
+    }
+
+    pub fn select_next(&mut self) {
+        self.move_selection(1);
+    }
+
+    pub fn parent_directory(&mut self) {
+        self.parent_directory_internal();
+    }
+
+    pub fn open_selected(&mut self) {
+        self.open_selected_internal();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -130,7 +99,7 @@ impl FileExplorer {
             .rem_euclid(self.entries.len() as isize) as usize;
     }
 
-    fn parent_directory(&mut self) {
+    fn parent_directory_internal(&mut self) {
         let Some(parent) = self.current_dir.parent() else {
             return;
         };
@@ -139,7 +108,7 @@ impl FileExplorer {
         self.load_entries();
     }
 
-    fn open_selected(&mut self) {
+    fn open_selected_internal(&mut self) {
         let Some(path) = self.entries.get(self.selected).cloned() else {
             return;
         };

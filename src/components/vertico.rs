@@ -1,4 +1,3 @@
-use iced::keyboard;
 use iced::widget::{column, container, row, rule, text};
 use iced::{Color, Element, Length, Padding};
 
@@ -8,6 +7,25 @@ pub struct Vertico {
     pub query: String,
     pub selected: usize,
     candidates: Vec<String>,
+    values: Vec<Vec<String>>,
+    pub action: Option<String>,
+    pub title: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerticoItem {
+    pub label: String,
+    pub arguments: Vec<String>,
+}
+
+impl From<&str> for VerticoItem {
+    fn from(value: &str) -> Self {
+        Self {
+            label: value.to_string(),
+            arguments: vec![value.to_string()],
+        }
+    }
 }
 
 impl Default for Vertico {
@@ -17,63 +35,47 @@ impl Default for Vertico {
             query: String::new(),
             selected: 0,
             candidates: Vec::new(),
+            values: Vec::new(),
+            action: None,
+            title: "Vertico".into(),
+            prompt: String::new(),
         }
     }
 }
 
 impl Vertico {
-    pub fn replace_candidates(&mut self, candidates: Vec<String>) {
-        self.candidates = candidates;
+    pub fn replace_items(&mut self, items: Vec<VerticoItem>) {
+        self.candidates = items.iter().map(|item| item.label.clone()).collect();
+        self.values = items.into_iter().map(|item| item.arguments).collect();
         self.selected = 0;
         self.query.clear();
     }
 
-    pub fn selected_candidate(&self) -> Option<&str> {
-        self.filtered().get(self.selected).copied()
-    }
-    pub fn update_key(&mut self, key: &keyboard::Key, text: Option<&str>) -> bool {
-        match key.as_ref() {
-            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                self.visible = false;
-                true
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                self.move_selection(-1);
-                true
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                self.move_selection(1);
-                true
-            }
-            keyboard::Key::Named(keyboard::key::Named::Backspace) => {
-                self.query.pop();
-                self.selected = 0;
-                true
-            }
-            keyboard::Key::Character(character) => {
-                if let Some(text) = text
-                    && !text.chars().all(char::is_control)
-                {
-                    self.query.push_str(text);
-                    self.selected = 0;
-                    return true;
-                }
-
-                match character {
-                    "Tab" => {
-                        self.visible = !self.visible;
-                        true
-                    }
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+    pub fn selected_arguments(&self) -> Option<&[String]> {
+        let candidate_index = {
+            let filtered: Vec<_> = self.filtered();
+            filtered.get(self.selected)?;
+            self.candidates
+                .iter()
+                .position(|candidate| candidate == filtered[self.selected])?
+        };
+        self.values.get(candidate_index).map(Vec::as_slice)
     }
 
-    pub fn toggle(&mut self) {
-        self.visible = !self.visible;
-        self.query.clear();
+    pub fn move_selection(&mut self, delta: isize) {
+        self.move_selection_internal(delta);
+    }
+
+    pub fn query_mut(&mut self) -> &mut String {
+        &mut self.query
+    }
+
+    pub fn reset_selection(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn insert_text(&mut self, text: &str) {
+        self.query.push_str(text);
         self.selected = 0;
     }
 
@@ -96,7 +98,7 @@ impl Vertico {
             .collect()
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    fn move_selection_internal(&mut self, delta: isize) {
         let count = self.filtered().len();
         if count == 0 {
             self.selected = 0;
@@ -146,9 +148,13 @@ impl Vertico {
         column![
             rule::horizontal(1),
             container(row![
-                text("M-x")
-                    .font(iced::Font::MONOSPACE)
-                    .width(Length::Fixed(38.0)),
+                text(if self.prompt.is_empty() {
+                    &self.title
+                } else {
+                    &self.prompt
+                })
+                .font(iced::Font::MONOSPACE)
+                .width(Length::Fixed(38.0)),
                 text(if self.query.is_empty() {
                     "_"
                 } else {
@@ -173,11 +179,12 @@ mod tests {
     #[test]
     fn filters_candidates_with_a_fuzzy_query() {
         let mut vertico = Vertico::default();
-        vertico.replace_candidates(vec![
-            "save-buffer".into(),
-            "switch-buffer".into(),
-            "list-buffers".into(),
-        ]);
+        vertico.replace_items(
+            ["save-buffer", "switch-buffer", "list-buffers"]
+                .into_iter()
+                .map(VerticoItem::from)
+                .collect(),
+        );
         vertico.query = "sf".into();
 
         assert_eq!(
@@ -191,7 +198,7 @@ mod tests {
         let mut vertico = Vertico::default();
         vertico.selected = 4;
 
-        assert!(vertico.update_key(&keyboard::Key::Character("f".into()), Some("f"),));
+        vertico.insert_text("f");
         assert_eq!(vertico.query, "f");
         assert_eq!(vertico.selected, 0);
     }
@@ -199,7 +206,12 @@ mod tests {
     #[test]
     fn selection_navigation_wraps() {
         let mut vertico = Vertico::default();
-        vertico.replace_candidates(vec!["save-buffer".into(), "switch-buffer".into()]);
+        vertico.replace_items(
+            ["save-buffer", "switch-buffer"]
+                .into_iter()
+                .map(VerticoItem::from)
+                .collect(),
+        );
 
         vertico.move_selection(-1);
         assert_eq!(vertico.selected, vertico.filtered().len() - 1);
@@ -214,7 +226,8 @@ mod tests {
         vertico.query = "file".into();
         vertico.selected = 3;
 
-        assert!(vertico.update_key(&keyboard::Key::Named(keyboard::key::Named::Backspace), None,));
+        vertico.query_mut().pop();
+        vertico.reset_selection();
         assert_eq!(vertico.query, "fil");
         assert_eq!(vertico.selected, 0);
     }
@@ -223,31 +236,21 @@ mod tests {
     fn escape_hides_vertico() {
         let mut vertico = Vertico::default();
 
-        assert!(vertico.update_key(&keyboard::Key::Named(keyboard::key::Named::Escape), None,));
+        vertico.visible = false;
         assert!(!vertico.visible);
     }
 
     #[test]
-    fn toggle_clears_query_and_selection() {
+    fn selected_item_reports_its_python_value() {
         let mut vertico = Vertico::default();
-        vertico.query = "file".into();
-        vertico.selected = 2;
+        vertico.replace_items(vec![VerticoItem {
+            label: "Open README".into(),
+            arguments: vec!["open-readme".into(), "README.md".into()],
+        }]);
 
-        vertico.toggle();
-        assert!(vertico.visible);
-        assert!(vertico.query.is_empty());
-        assert_eq!(vertico.selected, 0);
-
-        vertico.toggle();
-        assert!(!vertico.visible);
-    }
-
-    #[test]
-    fn selected_candidate_reports_the_current_result() {
-        let mut vertico = Vertico::default();
-        vertico.replace_candidates(vec!["about-arrow".into(), "current-directory".into()]);
-        vertico.query = "current".into();
-
-        assert_eq!(vertico.selected_candidate(), Some("current-directory"));
+        assert_eq!(
+            vertico.selected_arguments(),
+            Some(vec![String::from("open-readme"), String::from("README.md")].as_slice())
+        );
     }
 }
