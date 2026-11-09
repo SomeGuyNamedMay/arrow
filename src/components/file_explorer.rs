@@ -1,4 +1,4 @@
-use iced::widget::{column, container, row, text};
+use iced::widget::{Space, column, container, row, text};
 use iced::{Color, Element, Length};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -151,7 +151,7 @@ impl FileExplorer {
 
     pub fn view(&self) -> Element<'_, ()> {
         if !self.visible {
-            return container(text("")).height(Length::Shrink).into();
+            return Space::new().into();
         }
 
         let parent_entries = self

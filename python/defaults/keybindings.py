@@ -6,15 +6,40 @@ def selected_range(dot):
     return selection if selection is not None else (dot["cursor"], dot["cursor"])
 
 
+def update_focused_dots(update):
+    dots = arrow.dots()
+    arrow.set_dots([
+        update(dot) if dot["is_focused"] else dot
+        for dot in dots
+    ])
+
+
+def focus_adjacent_dot(delta):
+    dots = arrow.dots()
+    if not dots:
+        return
+
+    focused_indices = [
+        index for index, dot in enumerate(dots)
+        if dot["is_focused"]
+    ]
+    current = focused_indices[0] if focused_indices else (
+        0 if delta > 0 else len(dots) - 1
+    )
+    target = (current + delta) % len(dots)
+    arrow.set_dots([
+        dict(dot, is_focused=index == target)
+        for index, dot in enumerate(dots)
+    ])
+
+
 def move_horizontal(delta):
     text_length = len(arrow.text())
-    arrow.set_dots([
-        {
-            "cursor": max(0, min(text_length, dot["cursor"] + delta)),
-            "selection": None,
-        }
-        for dot in arrow.dots()
-    ])
+    update_focused_dots(lambda dot: {
+        "cursor": max(0, min(text_length, dot["cursor"] + delta)),
+        "selection": None,
+        "is_focused": dot["is_focused"],
+    })
 
 
 def move_vertical(delta):
@@ -22,23 +47,28 @@ def move_vertical(delta):
     lines = text.splitlines(True)
     if not lines:
         return
-    dots = []
-    for dot in arrow.dots():
+    offsets = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+
+    def move(dot):
         cursor = dot["cursor"]
         before = text[:cursor]
         row = before.count("\n")
         column = len(before) - before.rfind("\n") - 1
-        offsets = []
-        offset = 0
-        for line in lines:
-            offsets.append(offset)
-            offset += len(line)
         target_row = max(0, min(len(lines) - 1, row + delta))
         target_line = lines[target_row]
         target_column = min(column, max(0, len(target_line.rstrip("\n"))))
         target = offsets[target_row] + target_column
-        dots.append({"cursor": min(len(text), target), "selection": None})
-    arrow.set_dots(dots)
+        return {
+            "cursor": min(len(text), target),
+            "selection": None,
+            "is_focused": dot["is_focused"],
+        }
+
+    update_focused_dots(move)
 
 
 def delete_dots():
@@ -86,78 +116,103 @@ def move_right_command():
     move_horizontal(1)
 
 
+@arrow.command("focus-previous-dot")
+def focus_previous_dot_command():
+    focus_adjacent_dot(-1)
+
+
+@arrow.command("focus-next-dot")
+def focus_next_dot_command():
+    focus_adjacent_dot(1)
+
+
 @arrow.command("move-next-word")
 def move_next_word_command():
     text = arrow.text()
-    dots = []
-    for dot in arrow.dots():
+
+    def move(dot):
         cursor = min(len(text), dot["cursor"] + 1)
         while cursor < len(text) and text[cursor].isspace():
             cursor += 1
         while cursor < len(text) and not text[cursor].isspace():
             cursor += 1
-        dots.append({"cursor": cursor, "selection": None})
-    arrow.set_dots(dots)
+        return {
+            "cursor": cursor,
+            "selection": None,
+            "is_focused": dot["is_focused"],
+        }
+
+    update_focused_dots(move)
 
 
 @arrow.command("move-previous-word")
 def move_previous_word_command():
     text = arrow.text()
-    dots = []
-    for dot in arrow.dots():
+
+    def move(dot):
         cursor = max(0, dot["cursor"] - 1)
         while cursor > 0 and cursor < len(text) and text[cursor].isspace():
             cursor -= 1
         while cursor > 0 and cursor < len(text) and not text[cursor].isspace():
             cursor -= 1
-        dots.append({"cursor": cursor, "selection": None})
-    arrow.set_dots(dots)
+        return {
+            "cursor": cursor,
+            "selection": None,
+            "is_focused": dot["is_focused"],
+        }
+
+    update_focused_dots(move)
 
 
 @arrow.command("select-line")
 def select_line_command():
-    dots = []
-    for dot in arrow.dots():
-        text = arrow.text()
+    text = arrow.text()
+
+    def select(dot):
         cursor = dot["cursor"]
         start = text.rfind("\n", 0, cursor) + 1
         end = text.find("\n", cursor)
         if end == -1:
             end = len(text)
-        dots.append({"cursor": end, "selection": [start, end]})
-    arrow.set_dots(dots)
+        return {
+            "cursor": end,
+            "selection": [start, end],
+            "is_focused": dot["is_focused"],
+        }
+
+    update_focused_dots(select)
 
 
 @arrow.command("append-mode")
 def append_mode_command():
-    arrow.set_dots([
-        {
-            "cursor": min(len(arrow.text()), dot["cursor"] + 1),
-            "selection": None,
-        }
-        for dot in arrow.dots()
-    ])
+    text_length = len(arrow.text())
+    update_focused_dots(lambda dot: {
+        "cursor": min(text_length, dot["cursor"] + 1),
+        "selection": None,
+        "is_focused": dot["is_focused"],
+    })
     arrow.enter_insert_mode()
 
 
 @arrow.command("add-cursor-below")
 def add_cursor_below_command():
     dots = arrow.dots()
-    if not dots:
+    focused_dots = [dot for dot in dots if dot["is_focused"]]
+    if not focused_dots:
         return
-    primary = dots[-1]["cursor"]
     text = arrow.text()
     lines = text.splitlines(True)
     if not lines:
         return
-    before = text[:primary]
-    row = before.count("\n")
-    column = len(before) - before.rfind("\n") - 1
-    if row + 1 >= len(lines):
-        return
-    offset = sum(len(line) for line in lines[:row + 1])
-    target = offset + min(column, len(lines[row + 1].rstrip("\n")))
-    dots.append({"cursor": target, "selection": None})
+    for dot in focused_dots:
+        before = text[:dot["cursor"]]
+        row = before.count("\n")
+        column = len(before) - before.rfind("\n") - 1
+        if row + 1 >= len(lines):
+            continue
+        offset = sum(len(line) for line in lines[:row + 1])
+        target = offset + min(column, len(lines[row + 1].rstrip("\n")))
+        dots.append({"cursor": target, "selection": None, "is_focused": False})
     arrow.set_dots(dots)
 
 
@@ -178,7 +233,11 @@ def paste_command():
 
 @arrow.command("clear-selection")
 def clear_selection_command():
-    arrow.set_dots([{"cursor": dot["cursor"], "selection": None} for dot in arrow.dots()])
+    update_focused_dots(lambda dot: {
+        "cursor": dot["cursor"],
+        "selection": None,
+        "is_focused": dot["is_focused"],
+    })
 
 
 @arrow.command("insert-newline")
@@ -244,6 +303,8 @@ NORMAL_BINDINGS = {
     "down": "move-down",
     "up": "move-up",
     "right": "move-right",
+    "[": "focus-previous-dot",
+    "]": "focus-next-dot",
     "w": "move-next-word",
     "b": "move-previous-word",
     "x": "select-line",

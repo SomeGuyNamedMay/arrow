@@ -14,6 +14,7 @@ pub enum Mode {
 pub struct Dot {
     pub cursor: usize,
     pub selection: Option<SelectionRange>,
+    pub is_focused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,13 +33,11 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub struct TextEditor {
     pub buffer: Rope,
-    pub cursor: usize,
-    pub cursors: Vec<usize>,
-    pub anchors: Vec<Option<usize>>,
-    pub anchor: Option<usize>,
+    dots: Vec<Dot>,
     pub mode: Mode,
     scroll_y: f32,
     scroll_target_y: f32,
+    viewport_height: Option<f32>,
 }
 
 pub(crate) const TEXT_X: f32 = 12.0;
@@ -68,13 +67,15 @@ impl Default for TextEditor {
     fn default() -> Self {
         Self {
             buffer: Rope::new(),
-            cursor: 0,
-            cursors: vec![0],
-            anchors: vec![None],
-            anchor: None,
+            dots: vec![Dot {
+                cursor: 0,
+                selection: None,
+                is_focused: true,
+            }],
             mode: Mode::Normal,
             scroll_y: 0.0,
             scroll_target_y: 0.0,
+            viewport_height: None,
         }
     }
 }
@@ -96,44 +97,29 @@ impl TextEditor {
             self.buffer.remove(start..end);
             self.buffer.insert(start, &replacement);
         }
-        self.cursor = self.cursor.min(self.char_count().saturating_sub(1));
-        self.cursors = self
-            .cursors
+        self.dots = self
+            .dots
             .iter()
-            .map(|cursor| (*cursor).min(self.char_count().saturating_sub(1)))
+            .map(|dot| Dot {
+                cursor: dot.cursor.min(self.char_count().saturating_sub(1)),
+                ..*dot
+            })
             .collect();
+        self.ensure_focused_dots_visible();
     }
 
     pub fn dots(&self) -> Vec<Dot> {
-        let count = self.cursors.len().max(1);
-        self.cursors
-            .iter()
-            .enumerate()
-            .map(|(index, cursor)| Dot {
-                cursor: *cursor,
-                selection: self
-                    .anchors
-                    .get(index)
-                    .copied()
-                    .flatten()
-                    .or_else(|| (index == 0).then_some(self.anchor).flatten())
-                    .map(|anchor| SelectionRange {
-                        start: anchor.min(*cursor),
-                        end: anchor.max(*cursor).saturating_add(1),
-                    }),
-            })
-            .take(count)
-            .collect()
+        self.dots.clone()
     }
 
     pub fn set_dots(&mut self, dots: &[Dot]) {
         if dots.is_empty() {
             return;
         }
-        self.cursors = dots
+        self.dots = dots
             .iter()
-            .map(|dot| {
-                dot.selection.map_or(dot.cursor, |selection| {
+            .map(|dot| Dot {
+                cursor: dot.selection.map_or(dot.cursor, |selection| {
                     if dot.cursor >= selection.end {
                         selection.end.saturating_sub(1)
                     } else if dot.cursor <= selection.start {
@@ -141,43 +127,20 @@ impl TextEditor {
                     } else {
                         dot.cursor
                     }
-                })
+                }),
+                ..*dot
             })
             .collect();
-        self.anchors = dots
-            .iter()
-            .map(|dot| {
-                dot.selection.map(|selection| {
-                    if dot.cursor >= selection.end {
-                        selection.start
-                    } else if dot.cursor <= selection.start {
-                        selection.end.saturating_sub(1)
-                    } else {
-                        selection.start
-                    }
-                })
-            })
-            .collect();
-        self.anchor = self.anchors.first().copied().flatten();
-        self.cursor = self.cursors.last().copied().unwrap_or(0);
-        self.sync_anchors();
-    }
-
-    fn sync_anchors(&mut self) {
-        self.anchors.resize(self.cursors.len(), None);
-        if let Some(anchor) = self.anchor {
-            if let Some(first) = self.anchors.first_mut() {
-                *first = Some(anchor);
-            }
-        }
-        self.cursor = *self.cursors.last().unwrap_or(&0);
+        self.ensure_focused_dots_visible();
     }
 
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         self.buffer = Rope::from_str(&text.into());
-        self.cursor = 0;
-        self.cursors = vec![0];
-        self.anchor = None;
+        self.dots = vec![Dot {
+            cursor: 0,
+            selection: None,
+            is_focused: true,
+        }];
         self.scroll_y = 0.0;
         self.scroll_target_y = 0.0;
         self
@@ -189,6 +152,7 @@ impl TextEditor {
                 delta,
                 viewport_height,
             } => {
+                self.viewport_height = Some(viewport_height);
                 let max_scroll = self.max_scroll(viewport_height);
                 self.scroll_target_y = (self.scroll_target_y - delta).clamp(0.0, max_scroll);
                 return;
@@ -224,6 +188,58 @@ impl TextEditor {
         (self.scroll_target_y - self.scroll_y).abs() >= 0.5
     }
 
+    pub fn set_viewport_height(&mut self, viewport_height: f32) {
+        self.viewport_height = Some(viewport_height);
+        self.scroll_target_y = self.scroll_target_y.min(self.max_scroll(viewport_height));
+        self.ensure_focused_dots_visible();
+    }
+
+    fn ensure_focused_dots_visible(&mut self) {
+        let Some(viewport_height) = self.viewport_height else {
+            return;
+        };
+        let focused_rows = self
+            .dots
+            .iter()
+            .filter_map(|dot| dot.is_focused.then(|| self.position_at(dot.cursor).0))
+            .collect::<Vec<_>>();
+        let Some((&first, remaining_rows)) = focused_rows.split_first() else {
+            return;
+        };
+        let first_row = remaining_rows.iter().fold(first, |min, row| min.min(*row));
+        let last_row = remaining_rows.iter().fold(first, |max, row| max.max(*row));
+        let visible_height = (viewport_height - TEXT_Y).max(LINE_HEIGHT);
+        let focused_height = (last_row - first_row + 1) as f32 * LINE_HEIGHT;
+
+        if focused_height <= visible_height {
+            let first_top = first_row as f32 * LINE_HEIGHT;
+            let last_bottom = (last_row + 1) as f32 * LINE_HEIGHT;
+            if first_top < self.scroll_target_y {
+                self.scroll_target_y = first_top;
+            } else if last_bottom > self.scroll_target_y + visible_height {
+                self.scroll_target_y = last_bottom - visible_height;
+            }
+        } else {
+            let row = self
+                .dots
+                .iter()
+                .rev()
+                .find_map(|dot| dot.is_focused.then(|| self.position_at(dot.cursor).0))
+                .unwrap_or(first_row);
+            let top = row as f32 * LINE_HEIGHT;
+            let bottom = top + LINE_HEIGHT;
+            if top < self.scroll_target_y {
+                self.scroll_target_y = top;
+            } else if bottom > self.scroll_target_y + visible_height {
+                self.scroll_target_y = bottom - visible_height;
+            }
+        }
+
+        self.scroll_target_y = self
+            .scroll_target_y
+            .clamp(0.0, self.max_scroll(viewport_height));
+    }
+
     fn max_scroll(&self, viewport_height: f32) -> f32 {
         let content_height = self.buffer.len_lines() as f32 * LINE_HEIGHT + TEXT_Y;
         (content_height - viewport_height).max(0.0)
@@ -241,8 +257,8 @@ impl TextEditor {
     }
 
     fn insert_char(&mut self, character: char) {
-        let positions = self.cursors.iter().copied().collect::<Vec<_>>();
-        let old_primary = self.cursor;
+        let dots = self.dots.clone();
+        let positions = dots.iter().map(|dot| dot.cursor).collect::<Vec<_>>();
         let mut insertions = positions.clone();
         insertions.sort_unstable();
         insertions.dedup();
@@ -251,34 +267,38 @@ impl TextEditor {
             self.buffer.insert(position, &character.to_string());
         }
 
-        let mut transformed = Vec::with_capacity(positions.len());
-        for cursor in positions {
+        let mut transformed = Vec::with_capacity(dots.len());
+        for (dot, cursor) in dots.into_iter().zip(positions) {
             let following = insertions
                 .iter()
                 .filter(|&&position| position <= cursor)
                 .count();
             let next = cursor.saturating_add(following).min(self.char_count());
-            transformed.push(next);
+            transformed.push(Dot {
+                cursor: next,
+                ..dot
+            });
         }
-        transformed.sort_unstable();
-        transformed.dedup();
-        self.cursors = transformed;
-        let primary = old_primary
-            + insertions
-                .iter()
-                .filter(|&&position| position <= old_primary)
-                .count();
-        self.cursor = primary.min(self.char_count());
+        transformed.sort_unstable_by_key(|dot| dot.cursor);
+        let mut merged = Vec::<Dot>::with_capacity(transformed.len());
+        for dot in transformed {
+            if let Some(previous) = merged.last_mut()
+                && previous.cursor == dot.cursor
+            {
+                previous.is_focused |= dot.is_focused;
+            } else {
+                merged.push(dot);
+            }
+        }
+        self.dots = merged;
+        self.ensure_focused_dots_visible();
     }
 
     pub(crate) fn normal_mode(&mut self) {
         self.mode = Mode::Normal;
-        self.anchor = None;
-        self.anchors.fill(None);
-    }
-
-    fn position(&self) -> (usize, usize) {
-        self.position_at(self.cursor)
+        for dot in &mut self.dots {
+            dot.selection = None;
+        }
     }
 
     fn position_at(&self, cursor: usize) -> (usize, usize) {
@@ -289,21 +309,12 @@ impl TextEditor {
         (row, column)
     }
 
-    fn selected_ranges(&self) -> Vec<(usize, usize)> {
-        self.cursors
+    fn selected_ranges(&self, mode: Mode) -> Vec<(SelectionRange, Color)> {
+        self.dots
             .iter()
-            .enumerate()
-            .filter_map(|(index, &cursor)| {
-                let anchor = self.anchors.get(index).copied().flatten().or_else(|| {
-                    (index + 1 == self.cursors.len())
-                        .then_some(self.anchor)
-                        .flatten()
-                })?;
-                Some(if anchor <= cursor {
-                    (anchor, cursor.saturating_add(1))
-                } else {
-                    (cursor, anchor.saturating_add(1))
-                })
+            .filter_map(|dot| {
+                dot.selection
+                    .map(|range| (range, dot_color(mode, dot.is_focused)))
             })
             .collect()
     }
@@ -363,7 +374,7 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
         let first_row = (self.editor.scroll_y / LINE_HEIGHT).floor() as usize;
         let last_row = ((self.editor.scroll_y + bounds.height) / LINE_HEIGHT).ceil() as usize;
         let scroll_offset = self.editor.scroll_y;
-        let selections = self.editor.selected_ranges();
+        let selections = self.editor.selected_ranges(self.editor.mode);
 
         for (row, line) in lines
             .iter()
@@ -374,11 +385,13 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
             let line_start = self.editor.buffer.line_to_char(row);
             let y = TEXT_Y + row as f32 * LINE_HEIGHT - scroll_offset;
 
-            for &(selection_start, selection_end) in &selections {
-                let selection_start = selection_start
+            for &(selection, selection_color) in &selections {
+                let selection_start = selection
+                    .start
                     .max(line_start)
                     .min(line_start + line.chars().count());
-                let selection_end = selection_end
+                let selection_end = selection
+                    .end
                     .max(line_start)
                     .min(line_start + line.chars().count());
                 if selection_start < selection_end {
@@ -396,7 +409,7 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
                     frame.fill_rectangle(
                         Point::new(x, y),
                         iced::Size::new(width, LINE_HEIGHT - 2.0),
-                        Color::from_rgb(0.25, 0.42, 0.68),
+                        selection_color,
                     );
                 }
             }
@@ -410,8 +423,8 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
             frame.fill_text(text);
         }
 
-        for &cursor in &self.editor.cursors {
-            let (row, column) = self.editor.position_at(cursor);
+        for dot in &self.editor.dots {
+            let (row, column) = self.editor.position_at(dot.cursor);
             if row < first_row || row > last_row {
                 continue;
             }
@@ -425,34 +438,21 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
             frame.fill_rectangle(
                 Point::new(cursor_x, TEXT_Y + row as f32 * LINE_HEIGHT - scroll_offset),
                 iced::Size::new(character_width::<Renderer>("M"), LINE_HEIGHT - 2.0),
-                if self.editor.mode == Mode::Insert {
-                    Color::from_rgba(0.70, 0.85, 0.98, 0.55)
-                } else {
-                    Color::from_rgba(0.95, 0.72, 0.30, 0.85)
-                },
-            );
-        }
-
-        let (row, column) = self.editor.position();
-        if row < first_row || row > last_row {
-            return vec![frame.into_geometry()];
-        }
-        let line = lines.get(row).map(String::as_str).unwrap_or_default();
-        let prefix: String = line.chars().take(column).collect();
-        let cursor_x = if prefix.is_empty() {
-            TEXT_X
-        } else {
-            TEXT_X + character_width::<Renderer>(&prefix)
-        };
-        if !self.editor.cursors.contains(&self.editor.cursor) {
-            frame.fill_rectangle(
-                Point::new(cursor_x, TEXT_Y + row as f32 * LINE_HEIGHT - scroll_offset),
-                iced::Size::new(character_width::<Renderer>("M"), LINE_HEIGHT - 2.0),
-                Color::from_rgba(0.95, 0.72, 0.30, 0.85),
+                dot_color(self.editor.mode, dot.is_focused),
             );
         }
 
         vec![frame.into_geometry()]
+    }
+}
+
+fn dot_color(mode: Mode, is_focused: bool) -> Color {
+    if is_focused {
+        Color::from_rgba(0.20, 0.55, 0.95, 0.85)
+    } else if mode == Mode::Insert {
+        Color::from_rgba(0.70, 0.85, 0.98, 0.55)
+    } else {
+        Color::from_rgba(0.95, 0.72, 0.30, 0.85)
     }
 }
 
@@ -468,7 +468,16 @@ mod tests {
             key: keyboard::Key::Character("a".into()),
         });
         assert_eq!(editor.buffer.to_string(), "a");
-        assert_eq!(editor.cursor, 1);
+        assert_eq!(editor.dots()[0].cursor, 1);
+    }
+
+    #[test]
+    fn focused_dot_color_is_blue_in_both_modes() {
+        let blue = Color::from_rgba(0.20, 0.55, 0.95, 0.85);
+        assert_eq!(dot_color(Mode::Normal, true), blue);
+        assert_eq!(dot_color(Mode::Insert, true), blue);
+        assert_ne!(dot_color(Mode::Normal, false), blue);
+        assert_ne!(dot_color(Mode::Insert, false), blue);
     }
 
     #[test]
@@ -508,13 +517,59 @@ mod tests {
     }
 
     #[test]
-    fn cursor_position_uses_exact_monospace_advance() {
+    fn focused_dots_scroll_into_view_at_both_edges() {
+        let text = (0..20).map(|_| "line").collect::<Vec<_>>().join("\n");
+        let mut editor = TextEditor::default().with_text(text);
+        editor.set_viewport_height(100.0);
+
+        editor.set_dots(&[
+            Dot {
+                cursor: 20,
+                selection: None,
+                is_focused: true,
+            },
+            Dot {
+                cursor: 60,
+                selection: None,
+                is_focused: false,
+            },
+        ]);
+        assert_eq!(editor.scroll_target_y, 20.0);
+
+        editor.set_dots(&[
+            Dot {
+                cursor: 0,
+                selection: None,
+                is_focused: true,
+            },
+            Dot {
+                cursor: 60,
+                selection: None,
+                is_focused: false,
+            },
+        ]);
+        assert_eq!(editor.scroll_target_y, 0.0);
+
+        editor.set_dots(&[Dot {
+            cursor: 60,
+            selection: None,
+            is_focused: false,
+        }]);
+        assert_eq!(editor.scroll_target_y, 0.0);
+    }
+
+    #[test]
+    fn dot_position_uses_exact_monospace_advance() {
         let mut editor = TextEditor::default().with_text("Hello");
-        editor.cursor = 3;
+        editor.set_dots(&[Dot {
+            cursor: 3,
+            selection: None,
+            is_focused: true,
+        }]);
         let rendered_width = character_width::<Renderer>("Hel");
 
         assert!(rendered_width > 0.0);
-        assert_eq!(editor.position(), (0, 3));
+        assert_eq!(editor.position_at(editor.dots()[0].cursor), (0, 3));
     }
 
     #[test]
@@ -523,6 +578,7 @@ mod tests {
         editor.set_dots(&[Dot {
             cursor: 3,
             selection: Some(SelectionRange { start: 0, end: 3 }),
+            is_focused: true,
         }]);
 
         let dots = editor.dots();
@@ -534,24 +590,69 @@ mod tests {
     }
 
     #[test]
-    fn comma_keeps_only_the_first_cursor() {
-        let mut editor = TextEditor::default().with_text("one\ntwo\nthree");
-        editor.cursors = vec![1, 5, 9];
-        editor.cursor = 9;
+    fn selection_color_matches_its_dot_color() {
+        let mut editor = TextEditor::default().with_text("one\ntwo");
+        editor.set_dots(&[
+            Dot {
+                cursor: 3,
+                selection: Some(SelectionRange { start: 0, end: 3 }),
+                is_focused: true,
+            },
+            Dot {
+                cursor: 7,
+                selection: Some(SelectionRange { start: 4, end: 7 }),
+                is_focused: false,
+            },
+        ]);
 
-        editor.cursors.truncate(1);
-        editor.anchors.truncate(1);
-        editor.cursor = editor.cursors.first().copied().unwrap_or(0);
-
-        assert_eq!(editor.cursor, 1);
-        assert_eq!(editor.cursors, vec![1]);
+        let blue = Color::from_rgba(0.20, 0.55, 0.95, 0.85);
+        let selections = editor.selected_ranges(Mode::Normal);
+        assert_eq!(selections[0].1, blue);
+        assert_eq!(selections[0].1, dot_color(Mode::Normal, true));
+        assert_eq!(selections[1].1, dot_color(Mode::Normal, false));
     }
 
     #[test]
-    fn inserts_text_at_every_cursor() {
+    fn comma_keeps_only_the_first_dot() {
+        let mut editor = TextEditor::default().with_text("one\ntwo\nthree");
+        editor.set_dots(&[
+            Dot {
+                cursor: 1,
+                selection: None,
+                is_focused: true,
+            },
+            Dot {
+                cursor: 5,
+                selection: None,
+                is_focused: false,
+            },
+            Dot {
+                cursor: 9,
+                selection: None,
+                is_focused: false,
+            },
+        ]);
+        editor.set_dots(&editor.dots()[..1]);
+
+        assert_eq!(editor.dots().len(), 1);
+        assert_eq!(editor.dots()[0].cursor, 1);
+    }
+
+    #[test]
+    fn inserts_text_at_every_dot() {
         let mut editor = TextEditor::default().with_text("one\ntwo");
-        editor.cursors = vec![0, 4];
-        editor.cursor = 4;
+        editor.set_dots(&[
+            Dot {
+                cursor: 0,
+                selection: None,
+                is_focused: true,
+            },
+            Dot {
+                cursor: 4,
+                selection: None,
+                is_focused: false,
+            },
+        ]);
         editor.mode = Mode::Insert;
 
         editor.update(Message::Key {
@@ -559,6 +660,13 @@ mod tests {
         });
 
         assert_eq!(editor.buffer.to_string(), "xone\nxtwo");
-        assert_eq!(editor.cursors, vec![1, 6]);
+        assert_eq!(
+            editor
+                .dots()
+                .iter()
+                .map(|dot| dot.cursor)
+                .collect::<Vec<_>>(),
+            vec![1, 6]
+        );
     }
 }

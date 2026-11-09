@@ -16,6 +16,7 @@ pub(super) fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
         AppMessage::Editor(Message::ScrollFrame) | AppMessage::ScrollFrame => {
             app.editor.update(Message::ScrollFrame);
         }
+        AppMessage::ViewportHeight(height) => app.editor.set_viewport_height(height),
         AppMessage::Editor(message) => app.editor.update(message),
         AppMessage::Key { key, text } => {
             let python_mode = if app.vertico.visible {

@@ -5,6 +5,7 @@ use iced::keyboard;
 pub(super) enum AppMessage {
     Editor(Message),
     ScrollFrame,
+    ViewportHeight(f32),
     Key {
         key: keyboard::Key,
         text: Option<String>,

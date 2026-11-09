@@ -1,4 +1,4 @@
-use iced::widget::{column, container, row, rule, text};
+use iced::widget::{Space, column, container, row, rule, text};
 use iced::{Color, Element, Length, Padding};
 
 #[derive(Debug, Clone)]
@@ -111,7 +111,7 @@ impl Vertico {
 
     pub fn view(&self) -> Element<'_, ()> {
         if !self.visible {
-            return container(text("")).height(Length::Shrink).into();
+            return Space::new().into();
         }
 
         let filtered = self.filtered();

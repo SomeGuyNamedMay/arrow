@@ -227,6 +227,16 @@ mod tests {
     use crate::components::python::PythonAction;
     use crate::components::text_editor::SelectionRange;
 
+    fn run_dot_command(runtime: &PythonRuntime, command: &str, dots: &[Dot]) -> Vec<Dot> {
+        runtime.set_editor_dots(dots).unwrap();
+        runtime.execute(command).unwrap();
+        let actions = PythonRuntime::take_actions();
+        let [PythonAction::ReplaceDots(dots)] = actions.as_slice() else {
+            panic!("'{command}' should update editor dots");
+        };
+        dots.clone()
+    }
+
     #[test]
     fn default_python_commands_are_registered() {
         let runtime = PythonRuntime::new().unwrap();
@@ -328,10 +338,12 @@ mod tests {
                 Dot {
                     cursor: 4,
                     selection: None,
+                    is_focused: false,
                 },
                 Dot {
                     cursor: 9,
                     selection: Some(SelectionRange { start: 7, end: 10 }),
+                    is_focused: true,
                 },
             ])
             .unwrap();
@@ -348,6 +360,251 @@ mod tests {
                     .unwrap(),
                 2
             );
+            let dots = module.getattr("dots").unwrap().call0().unwrap();
+            assert!(
+                !dots
+                    .get_item(0)
+                    .unwrap()
+                    .get_item("is_focused")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                dots.get_item(1)
+                    .unwrap()
+                    .get_item("is_focused")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
         });
+    }
+
+    #[test]
+    fn focus_helpers_manage_multiple_dots() {
+        let runtime = PythonRuntime::new().unwrap();
+        runtime
+            .set_editor_dots(&[
+                Dot {
+                    cursor: 1,
+                    selection: None,
+                    is_focused: false,
+                },
+                Dot {
+                    cursor: 4,
+                    selection: None,
+                    is_focused: true,
+                },
+                Dot {
+                    cursor: 8,
+                    selection: None,
+                    is_focused: false,
+                },
+            ])
+            .unwrap();
+
+        Python::attach(|py| {
+            let module = runtime.module.bind(py);
+            let focused = module.getattr("focused_dots").unwrap().call0().unwrap();
+            assert_eq!(focused.len().unwrap(), 1);
+            assert_eq!(
+                focused
+                    .get_item(0)
+                    .unwrap()
+                    .get_item("cursor")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                4
+            );
+            module
+                .getattr("set_dot_focused")
+                .unwrap()
+                .call1((0, true))
+                .unwrap();
+        });
+
+        let actions = PythonRuntime::take_actions();
+        let [PythonAction::ReplaceDots(dots)] = actions.as_slice() else {
+            panic!("set_dot_focused should update dot focus state");
+        };
+        assert_eq!(
+            dots.iter().map(|dot| dot.is_focused).collect::<Vec<_>>(),
+            vec![true, true, false]
+        );
+
+        Python::attach(|py| {
+            let module = runtime.module.bind(py);
+            module.getattr("unfocus_all_dots").unwrap().call0().unwrap();
+        });
+        let actions = PythonRuntime::take_actions();
+        let [PythonAction::ReplaceDots(dots)] = actions.as_slice() else {
+            panic!("unfocus_all_dots should update every dot");
+        };
+        assert!(dots.iter().all(|dot| !dot.is_focused));
+
+        Python::attach(|py| {
+            let module = runtime.module.bind(py);
+            module.getattr("focus_all_dots").unwrap().call0().unwrap();
+        });
+        let actions = PythonRuntime::take_actions();
+        let [PythonAction::ReplaceDots(dots)] = actions.as_slice() else {
+            panic!("focus_all_dots should update every dot");
+        };
+        assert!(dots.iter().all(|dot| dot.is_focused));
+    }
+
+    #[test]
+    fn add_cursor_below_creates_an_unfocused_dot() {
+        let runtime = PythonRuntime::new().unwrap();
+        runtime.set_editor_text("one\ntwo").unwrap();
+        runtime
+            .set_editor_dots(&[Dot {
+                cursor: 1,
+                selection: None,
+                is_focused: true,
+            }])
+            .unwrap();
+
+        runtime.execute("add-cursor-below").unwrap();
+
+        let actions = PythonRuntime::take_actions();
+        let [PythonAction::ReplaceDots(dots)] = actions.as_slice() else {
+            panic!("add-cursor-below should replace the editor dots");
+        };
+        assert_eq!(
+            dots.iter().map(|dot| dot.is_focused).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+    }
+
+    #[test]
+    fn movement_and_selection_commands_ignore_unfocused_dots() {
+        let runtime = PythonRuntime::new().unwrap();
+        runtime.set_editor_text("one\ntwo").unwrap();
+        let dots = [
+            Dot {
+                cursor: 1,
+                selection: Some(SelectionRange { start: 0, end: 2 }),
+                is_focused: true,
+            },
+            Dot {
+                cursor: 5,
+                selection: Some(SelectionRange { start: 4, end: 6 }),
+                is_focused: false,
+            },
+        ];
+
+        let moved = run_dot_command(&runtime, "move-right", &dots);
+        assert_eq!(moved[0].cursor, 2);
+        assert_eq!(moved[0].selection, None);
+        assert_eq!(moved[1], dots[1]);
+
+        let moved = run_dot_command(&runtime, "move-down", &dots);
+        assert_eq!(moved[0].cursor, 5);
+        assert_eq!(moved[0].selection, None);
+        assert_eq!(moved[1], dots[1]);
+
+        let selected = run_dot_command(&runtime, "select-line", &dots);
+        assert_eq!(selected[0].cursor, 3);
+        assert_eq!(
+            selected[0].selection,
+            Some(SelectionRange { start: 0, end: 3 })
+        );
+        assert_eq!(selected[1], dots[1]);
+
+        let cleared = run_dot_command(&runtime, "clear-selection", &dots);
+        assert_eq!(cleared[0].selection, None);
+        assert_eq!(cleared[1], dots[1]);
+    }
+
+    #[test]
+    fn bracket_keys_cycle_the_focused_dot() {
+        let runtime = PythonRuntime::new().unwrap();
+        let dots = [
+            Dot {
+                cursor: 1,
+                selection: None,
+                is_focused: false,
+            },
+            Dot {
+                cursor: 4,
+                selection: None,
+                is_focused: true,
+            },
+            Dot {
+                cursor: 8,
+                selection: None,
+                is_focused: false,
+            },
+        ];
+
+        assert_eq!(
+            runtime.command_for_key("normal", "["),
+            Some("focus-previous-dot".to_string())
+        );
+        assert_eq!(
+            runtime.command_for_key("normal", "]"),
+            Some("focus-next-dot".to_string())
+        );
+
+        let previous = run_dot_command(&runtime, "focus-previous-dot", &dots);
+        assert_eq!(
+            previous
+                .iter()
+                .map(|dot| dot.is_focused)
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+
+        let next = run_dot_command(&runtime, "focus-next-dot", &dots);
+        assert_eq!(
+            next.iter().map(|dot| dot.is_focused).collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+    }
+
+    #[test]
+    fn set_dots_preserves_focus_when_not_specified() {
+        let runtime = PythonRuntime::new().unwrap();
+        runtime
+            .set_editor_dots(&[
+                Dot {
+                    cursor: 1,
+                    selection: None,
+                    is_focused: true,
+                },
+                Dot {
+                    cursor: 4,
+                    selection: None,
+                    is_focused: false,
+                },
+            ])
+            .unwrap();
+
+        Python::attach(|py| {
+            let module = runtime.module.bind(py);
+            let first = PyDict::new(py);
+            first.set_item("cursor", 2).unwrap();
+            first.set_item("selection", py.None()).unwrap();
+            let second = PyDict::new(py);
+            second.set_item("cursor", 5).unwrap();
+            second.set_item("selection", py.None()).unwrap();
+            let new_dots = PyList::new(py, [first, second]).unwrap();
+            module
+                .getattr("set_dots")
+                .unwrap()
+                .call1((new_dots,))
+                .unwrap();
+        });
+        let actions = PythonRuntime::take_actions();
+        let [PythonAction::ReplaceDots(dots)] = actions.as_slice() else {
+            panic!("set_dots should replace dot positions");
+        };
+        assert_eq!(
+            dots.iter().map(|dot| dot.is_focused).collect::<Vec<_>>(),
+            vec![true, false]
+        );
     }
 }

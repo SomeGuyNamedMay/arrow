@@ -30,17 +30,46 @@ def dots():
     return _editor_dots.copy()
 
 def set_dots(new_dots):
+    new_dots = list(new_dots)
+    current_dots = dots()
     converted = []
-    for dot in new_dots:
+    for index, dot in enumerate(new_dots):
+        default_focus = (
+            current_dots[index]["is_focused"]
+            if index < len(current_dots)
+            else index == len(new_dots) - 1
+        )
         if isinstance(dot, dict):
             cursor = dot["cursor"]
             selection = dot.get("selection")
+            is_focused = dot.get("is_focused", default_focus)
         else:
-            cursor, selection = dot
+            cursor, selection, *focus = dot
+            is_focused = focus[0] if focus else default_focus
         if selection is not None:
             selection = (selection[0], selection[1])
-        converted.append((cursor, selection))
+        converted.append((cursor, selection, is_focused))
     arrow_set_dots(converted)
+
+def focused_dots():
+    return [dot for dot in dots() if dot["is_focused"]]
+
+def set_dot_focused(index, is_focused=True):
+    current_dots = dots()
+    current_dots[index]["is_focused"] = bool(is_focused)
+    set_dots(current_dots)
+
+def focus_all_dots():
+    current_dots = dots()
+    for dot in current_dots:
+        dot["is_focused"] = True
+    set_dots(current_dots)
+
+def unfocus_all_dots():
+    current_dots = dots()
+    for dot in current_dots:
+        dot["is_focused"] = False
+    set_dots(current_dots)
 
 def show_vertico(title, items, action, prompt=""):
     normalized = []
@@ -144,12 +173,13 @@ fn run_command(name: &str) {
 }
 
 #[pyfunction]
-fn arrow_set_dots(dots: Vec<(usize, Option<(usize, usize)>)>) {
+fn arrow_set_dots(dots: Vec<(usize, Option<(usize, usize)>, bool)>) {
     let dots = dots
         .into_iter()
-        .map(|(cursor, selection)| Dot {
+        .map(|(cursor, selection, is_focused)| Dot {
             cursor,
             selection: selection.map(|(start, end)| SelectionRange { start, end }),
+            is_focused,
         })
         .collect();
     PYTHON_ACTIONS.with(|actions| {
@@ -176,6 +206,7 @@ pub(super) fn publish_editor_dots(module: &Bound<'_, PyModule>, dots: Vec<Dot>) 
     for dot in dots {
         let item = PyDict::new(module.py());
         item.set_item("cursor", dot.cursor)?;
+        item.set_item("is_focused", dot.is_focused)?;
         item.set_item(
             "selection",
             dot.selection
