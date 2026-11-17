@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use super::syntax::CompletionServerConfig;
+use super::syntax::LanguageServerConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompletionCandidate {
@@ -33,7 +33,7 @@ pub(crate) struct LspClient {
 
 impl LspClient {
     pub(crate) fn start(
-        config: CompletionServerConfig,
+        config: LanguageServerConfig,
         path: &Path,
         language_id: String,
     ) -> Result<Self, String> {

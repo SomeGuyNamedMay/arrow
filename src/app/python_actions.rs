@@ -8,7 +8,7 @@ pub(super) fn apply_python_actions(app: &mut Arrow) {
         match action {
             PythonAction::OpenBuffer { contents, path } => {
                 app.editor = TextEditor::default().with_text(contents);
-                configure_syntax(app, std::path::Path::new(&path));
+                configure_language(app, std::path::Path::new(&path));
             }
             PythonAction::EnterInsertMode => {
                 app.editor.mode = Mode::Insert;
@@ -52,7 +52,7 @@ pub(super) fn apply_python_actions(app: &mut Arrow) {
                     match std::fs::read_to_string(&path) {
                         Ok(contents) => {
                             app.editor = TextEditor::default().with_text(contents);
-                            configure_syntax(app, &path);
+                            configure_language(app, &path);
                             app.explorer.visible = false;
                         }
                         Err(error) => eprintln!("Failed to open {}: {error}", path.display()),
@@ -93,12 +93,28 @@ pub(super) fn apply_python_actions(app: &mut Arrow) {
                 execute_python(app, &command);
             }
             PythonAction::ReplaceDots(dots) => app.editor.set_dots(&dots),
-            PythonAction::SelectFunction => app.editor.select_function_at_focused_dots(),
+            PythonAction::SelectFunction => {
+                if let Some(config) = &app.syntax_config {
+                    app.editor
+                        .select_text_object_at_focused_dots(&config.text_object_kinds);
+                }
+            }
         }
     }
 }
 
-fn configure_syntax(app: &mut Arrow, path: &std::path::Path) {
+fn configure_language(app: &mut Arrow, path: &std::path::Path) {
+    app.lsp_generation = app.lsp_generation.wrapping_add(1);
+    app.lsp = None;
+    app.editor.clear_highlights();
+    app.lsp_version = 0;
+    app.lsp_text.clear();
+    app.syntax_text.clear();
+    app.completion_pending = false;
+    app.lsp_start_pending = false;
+    app.lsp_path = Some(path.to_path_buf());
+    app.syntax_config = None;
+    app.lsp_config = None;
     let languages = match &app.python {
         Some(python) => match python.syntax_languages() {
             Ok(languages) => languages,
@@ -109,40 +125,23 @@ fn configure_syntax(app: &mut Arrow, path: &std::path::Path) {
         },
         None => Vec::new(),
     };
-    if let Err(error) = app.editor.set_syntax_languages(languages.clone()) {
-        eprintln!("Invalid syntax configuration: {error}");
-        return;
-    }
-    app.lsp_generation = app.lsp_generation.wrapping_add(1);
-    app.lsp = None;
-    app.lsp_version = 0;
-    app.lsp_text.clear();
-    app.completion_pending = false;
-    app.lsp_path = Some(path.to_path_buf());
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    app.lsp_config = languages.into_iter().find_map(|language| {
-        language
-            .extensions
-            .iter()
-            .any(|candidate| {
-                candidate
-                    .trim_start_matches('.')
-                    .eq_ignore_ascii_case(&extension)
-            })
-            .then(|| {
-                language
-                    .completion_server
-                    .map(|server| (language.name, server))
-            })
-            .flatten()
+    app.syntax_config = languages.into_iter().find(|language| {
+        language.extensions.iter().any(|candidate| {
+            candidate
+                .trim_start_matches('.')
+                .eq_ignore_ascii_case(&extension)
+        })
     });
-    if let Err(error) = app.editor.set_file_path(path) {
-        eprintln!("{error}");
-    }
+    app.lsp_config = app
+        .syntax_config
+        .as_ref()
+        .filter(|language| language.language_server.is_some())
+        .cloned();
 }
 
 pub(super) fn execute_python(app: &mut Arrow, command: &str) {
@@ -161,20 +160,4 @@ pub(super) fn execute_python(app: &mut Arrow, command: &str) {
         eprintln!("{error}");
     }
     apply_python_actions(app);
-    sync_lsp_document(app);
-}
-
-pub(super) fn sync_lsp_document(app: &mut Arrow) {
-    let text = app.editor.buffer.to_string();
-    if text == app.lsp_text {
-        return;
-    }
-    if let Some(lsp) = &app.lsp {
-        app.lsp_version = app.lsp_version.saturating_add(1);
-        if let Err(error) = lsp.did_change(app.lsp_version, &text) {
-            eprintln!("{error}");
-        } else {
-            app.lsp_text = text;
-        }
-    }
 }

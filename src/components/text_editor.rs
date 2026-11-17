@@ -3,9 +3,8 @@ use iced::keyboard;
 use iced::widget::canvas::{self, Canvas, Geometry};
 use iced::{Color, Element, Length, Point, Rectangle, Renderer, Theme, mouse};
 use ropey::Rope;
-use std::path::Path;
 
-use super::syntax::{SyntaxLanguageConfig, SyntaxState};
+use super::syntax::{AstNode, HighlightSpan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -42,7 +41,8 @@ pub enum Message {
 pub struct TextEditor {
     pub buffer: Rope,
     dots: Vec<Dot>,
-    syntax: SyntaxState,
+    syntax_tree: Option<AstNode>,
+    highlights_by_line: Vec<Vec<HighlightSpan>>,
     pub mode: Mode,
     scroll_y: f32,
     scroll_target_y: f32,
@@ -76,7 +76,8 @@ impl Default for TextEditor {
     fn default() -> Self {
         Self {
             buffer: Rope::new(),
-            syntax: SyntaxState::default(),
+            syntax_tree: None,
+            highlights_by_line: Vec::new(),
             dots: vec![Dot {
                 cursor: 0,
                 selection: None,
@@ -107,7 +108,6 @@ impl TextEditor {
             self.buffer.remove(start..end);
             self.buffer.insert(start, &replacement);
         }
-        self.refresh_syntax();
         self.dots = self
             .dots
             .iter()
@@ -147,7 +147,7 @@ impl TextEditor {
 
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         self.buffer = Rope::from_str(&text.into());
-        self.refresh_syntax();
+        self.clear_highlights();
         self.dots = vec![Dot {
             cursor: 0,
             selection: None,
@@ -158,23 +158,49 @@ impl TextEditor {
         self
     }
 
-    pub fn set_file_path(&mut self, path: &Path) -> Result<(), String> {
-        self.syntax.set_file_path(path, &self.buffer.to_string())
+    fn set_highlights(&mut self, highlights: Vec<HighlightSpan>) {
+        self.highlights_by_line = vec![Vec::new(); self.buffer.len_lines()];
+        for highlight in highlights {
+            if highlight.start >= highlight.end || highlight.start >= self.buffer.len_chars() {
+                continue;
+            }
+            let first_line = self.buffer.char_to_line(highlight.start);
+            let last_line = self
+                .buffer
+                .char_to_line(highlight.end.saturating_sub(1).min(self.buffer.len_chars()));
+            for line in first_line..=last_line {
+                self.highlights_by_line[line].push(highlight);
+            }
+        }
     }
 
-    pub fn set_syntax_languages(
+    pub fn set_syntax_tree(
         &mut self,
-        languages: Vec<SyntaxLanguageConfig>,
-    ) -> Result<(), String> {
-        self.syntax.set_languages(languages)
+        syntax_tree: Option<AstNode>,
+        highlight_colors: &std::collections::BTreeMap<String, (Color, u8)>,
+    ) {
+        let mut highlights = Vec::new();
+        if let Some(tree) = &syntax_tree {
+            tree.highlights(highlight_colors, &mut highlights);
+        }
+        self.syntax_tree = syntax_tree;
+        self.set_highlights(highlights);
     }
 
-    pub fn select_function_at_focused_dots(&mut self) {
+    pub fn clear_highlights(&mut self) {
+        self.syntax_tree = None;
+        self.highlights_by_line.clear();
+    }
+
+    pub fn select_text_object_at_focused_dots(&mut self, kinds: &[String]) {
+        let Some(tree) = &self.syntax_tree else {
+            return;
+        };
         for dot in &mut self.dots {
             if !dot.is_focused {
                 continue;
             }
-            if let Some((start, end)) = self.syntax.enclosing_function(&self.buffer, dot.cursor) {
+            if let Some((start, end)) = tree.enclosing_text_object(dot.cursor, kinds) {
                 dot.cursor = end.saturating_sub(1);
                 dot.selection = Some(SelectionRange { start, end });
             }
@@ -194,12 +220,6 @@ impl TextEditor {
             dot.selection = None;
         }
         self.ensure_focused_dots_visible();
-    }
-
-    fn refresh_syntax(&mut self) {
-        if let Err(error) = self.syntax.reparse(&self.buffer.to_string()) {
-            eprintln!("{error}");
-        }
     }
 
     pub fn update(&mut self, message: Message) {
@@ -355,7 +375,7 @@ impl TextEditor {
             }
         }
         self.dots = merged;
-        self.refresh_syntax();
+
         self.ensure_focused_dots_visible();
     }
 
@@ -479,18 +499,33 @@ impl canvas::Program<Message> for EditorCanvas<'_> {
                 }
             }
 
-            let line_start_byte = self.editor.buffer.line_to_byte(row);
-            let line_end_byte = line_start_byte + line.len();
+            let line_start_char = self.editor.buffer.line_to_char(row);
+            let line_char_count = line.chars().count();
+            let line_end_char = line_start_char + line_char_count;
             let mut boundaries = vec![0, line.len()];
             let line_spans = self
                 .editor
-                .syntax
-                .line_highlights(row)
-                .iter()
+                .highlights_by_line
+                .get(row)
+                .into_iter()
+                .flatten()
                 .filter_map(|span| {
-                    let start = span.start_byte.max(line_start_byte);
-                    let end = span.end_byte.min(line_end_byte);
-                    (start < end).then_some((start - line_start_byte, end - line_start_byte, *span))
+                    let start = span.start.max(line_start_char);
+                    let end = span.end.min(line_end_char);
+                    if start >= end {
+                        return None;
+                    }
+                    let start_char = start - line_start_char;
+                    let end_char = end - line_start_char;
+                    let start_byte = line
+                        .char_indices()
+                        .nth(start_char)
+                        .map_or(line.len(), |(byte, _)| byte);
+                    let end_byte = line
+                        .char_indices()
+                        .nth(end_char)
+                        .map_or(line.len(), |(byte, _)| byte);
+                    Some((start_byte, end_byte, *span))
                 })
                 .collect::<Vec<_>>();
             for (start, end, _) in &line_spans {
@@ -743,14 +778,34 @@ mod tests {
     }
 
     #[test]
-    fn select_function_selects_only_at_focused_dots() {
+    fn select_text_object_updates_only_focused_dots() {
         let source = "fn first() {}\nfn second() { let x = 1; }\n";
+        let second_start = source.find("fn second").unwrap();
+        let second_end = source.trim_end().len();
         let mut editor = TextEditor::default().with_text(source);
-        let python = crate::components::python::PythonRuntime::new().unwrap();
-        editor
-            .set_syntax_languages(python.syntax_languages().unwrap())
-            .unwrap();
-        editor.set_file_path(Path::new("example.rs")).unwrap();
+        let tree = AstNode {
+            kind: "root".to_string(),
+            start: 0,
+            end: source.chars().count(),
+            capture: None,
+            children: vec![
+                AstNode {
+                    kind: "function".to_string(),
+                    start: 0,
+                    end: "fn first() {}".len(),
+                    capture: None,
+                    children: vec![],
+                },
+                AstNode {
+                    kind: "function".to_string(),
+                    start: second_start,
+                    end: second_end,
+                    capture: None,
+                    children: vec![],
+                },
+            ],
+        };
+        editor.set_syntax_tree(Some(tree), &Default::default());
         editor.set_dots(&[
             Dot {
                 cursor: source.find("let x").unwrap(),
@@ -764,7 +819,7 @@ mod tests {
             },
         ]);
 
-        editor.select_function_at_focused_dots();
+        editor.select_text_object_at_focused_dots(&["function".to_string()]);
         let dots = editor.dots();
         let selection = dots[0].selection.unwrap();
         assert!(

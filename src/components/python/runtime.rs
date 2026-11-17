@@ -1,6 +1,6 @@
 use super::api;
 use super::{PYTHON_ACTIONS, PythonAction};
-use crate::components::syntax::{CompletionServerConfig, SyntaxLanguageConfig};
+use crate::components::syntax::{AstNode, LanguageServerConfig, SyntaxLanguageConfig};
 use crate::components::text_editor::Dot;
 use iced::Color;
 use pyo3::prelude::*;
@@ -167,31 +167,36 @@ impl PythonRuntime {
                             .map_err(|error| format!("Language field '{key}' must be a string: {error}"))
                     };
                     let name = get_string("name")?;
-                    let grammar = get_string("grammar")?;
-                    let highlights_query = get_string("highlights_query")?;
-                    let completion_server = language
-                        .get_item("completion_server")
+                    let parser = language
+                        .get_item("parser")
+                        .map_err(|error| error.to_string())?
+                        .filter(|value| !value.is_none());
+                    if parser.as_ref().is_some_and(|parser| !parser.is_callable()) {
+                        return Err(format!("Language '{name}' parser must be callable"));
+                    }
+                    let language_server = language
+                        .get_item("language_server")
                         .map_err(|error| error.to_string())?
                         .filter(|value| !value.is_none())
                         .map(|value| {
                             let server = value
                                 .cast_into::<PyDict>()
-                                .map_err(|error| format!("Language '{name}' completion_server must be a dictionary: {error}"))?;
+                                .map_err(|error| format!("Language '{name}' language_server must be a dictionary: {error}"))?;
                             let Some(command_value) = server
                                 .get_item("command")
                                 .map_err(|error| error.to_string())?
                             else {
-                                return Err(format!("Language '{name}' completion server is missing 'command'"));
+                                return Err(format!("Language '{name}' language server is missing 'command'"));
                             };
                             let command = command_value
                                 .extract::<String>()
-                                .map_err(|error| format!("Language '{name}' completion server command must be a string: {error}"))?;
+                                .map_err(|error| format!("Language '{name}' language server command must be a string: {error}"))?;
                             let arguments = server
                                 .get_item("args")
                                 .map_err(|error| error.to_string())?
                                 .map(|value| value.extract::<Vec<String>>())
                                 .transpose()
-                                .map_err(|error| format!("Language '{name}' completion server args must be strings: {error}"))?
+                                .map_err(|error| format!("Language '{name}' language server args must be strings: {error}"))?
                                 .unwrap_or_default();
                             let root_markers = server
                                 .get_item("root_markers")
@@ -200,7 +205,7 @@ impl PythonRuntime {
                                 .transpose()
                                 .map_err(|error| format!("Language '{name}' root markers must be strings: {error}"))?
                                 .unwrap_or_default();
-                            Ok::<_, String>(CompletionServerConfig {
+                            Ok::<_, String>(LanguageServerConfig {
                                 command,
                                 arguments,
                                 root_markers,
@@ -213,19 +218,13 @@ impl PythonRuntime {
                         .ok_or_else(|| format!("Language '{name}' is missing 'extensions'"))?
                         .extract::<Vec<String>>()
                         .map_err(|error| format!("Language '{name}' extensions must be strings: {error}"))?;
-                    let function_nodes = language
-                        .get_item("function_nodes")
-                        .map_err(|error| error.to_string())?
-                        .ok_or_else(|| format!("Language '{name}' is missing 'function_nodes'"))?
-                        .extract::<Vec<String>>()
-                        .map_err(|error| format!("Language '{name}' function_nodes must be strings: {error}"))?;
                     let colors = language
-                        .get_item("capture_colors")
+                        .get_item("highlight_colors")
                         .map_err(|error| error.to_string())?
-                        .ok_or_else(|| format!("Language '{name}' is missing 'capture_colors'"))?
+                        .ok_or_else(|| format!("Language '{name}' is missing 'highlight_colors'"))?
                         .cast_into::<PyDict>()
-                        .map_err(|error| format!("Language '{name}' capture_colors must be a dictionary: {error}"))?;
-                    let mut capture_colors = std::collections::BTreeMap::new();
+                        .map_err(|error| format!("Language '{name}' highlight_colors must be a dictionary: {error}"))?;
+                    let mut highlight_colors = BTreeMap::new();
                     for (capture, value) in colors.iter() {
                         let capture = capture
                             .extract::<String>()
@@ -244,19 +243,68 @@ impl PythonRuntime {
                             .map_err(|error| format!("Invalid blue channel for capture '{capture}': {error}"))?;
                         let priority = values.get_item(3).and_then(|item| item.extract::<u8>())
                             .map_err(|error| format!("Invalid priority for capture '{capture}': {error}"))?;
-                        capture_colors.insert(capture, (Color::from_rgb(red, green, blue), priority));
+                        highlight_colors
+                            .insert(capture, (Color::from_rgb(red, green, blue), priority));
                     }
+                    let text_object_kinds = language
+                        .get_item("text_object_kinds")
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("Language '{name}' is missing 'text_object_kinds'"))?
+                        .extract::<Vec<String>>()
+                        .map_err(|error| format!("Language '{name}' text_object_kinds must be strings: {error}"))?;
                     Ok(SyntaxLanguageConfig {
                         name,
-                        grammar,
                         extensions,
-                        highlights_query,
-                        function_nodes,
-                        capture_colors,
-                        completion_server,
+                        highlight_colors,
+                        text_object_kinds,
+                        language_server,
                     })
                 })
                 .collect()
+        })
+    }
+
+    pub fn parse_syntax(
+        &self,
+        language_name: &str,
+        source: &str,
+    ) -> Result<Option<AstNode>, String> {
+        Python::attach(|py| {
+            let module = self.module.bind(py);
+            let languages = module.getattr("syntax_languages").map_err(|error| {
+                format!("Python syntax_languages must be a dictionary: {error}")
+            })?;
+            let languages = languages.cast_into::<PyDict>().map_err(|error| {
+                format!("Python syntax_languages must be a dictionary: {error}")
+            })?;
+            let Some(language) = languages
+                .get_item(language_name)
+                .map_err(|error| error.to_string())?
+            else {
+                return Err(format!("No Python syntax language named '{language_name}'"));
+            };
+            let language = language.cast_into::<PyDict>().map_err(|error| {
+                format!("Language '{language_name}' must be a dictionary: {error}")
+            })?;
+            let Some(parser) = language
+                .get_item("parser")
+                .map_err(|error| error.to_string())?
+                .filter(|parser| !parser.is_none())
+            else {
+                return Ok(None);
+            };
+            if !parser.is_callable() {
+                return Err(format!(
+                    "Language '{language_name}' parser must be callable"
+                ));
+            }
+            let result = parser
+                .call1((source,))
+                .map_err(|error| format!("Python parser for '{language_name}' failed: {error}"))?;
+            if result.is_none() {
+                return Ok(None);
+            }
+            parse_ast_node(&result, source.chars().count(), 0, None).map(Some)
         })
     }
 
@@ -352,6 +400,82 @@ impl PythonRuntime {
     }
 }
 
+fn parse_ast_node(
+    value: &Bound<'_, PyAny>,
+    source_length: usize,
+    depth: usize,
+    parent_range: Option<(usize, usize)>,
+) -> Result<AstNode, String> {
+    if depth > 256 {
+        return Err("Python syntax AST exceeds the maximum nesting depth".to_string());
+    }
+    let node = value
+        .cast::<PyDict>()
+        .map_err(|error| format!("Python parser AST nodes must be dictionaries: {error}"))?;
+    let get_required = |key: &str| -> Result<Bound<'_, PyAny>, String> {
+        node.get_item(key)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Python parser AST node is missing '{key}'"))
+    };
+    let kind = get_required("kind")?
+        .extract::<String>()
+        .map_err(|error| format!("Python parser AST node kind must be a string: {error}"))?;
+    if kind.is_empty() {
+        return Err("Python parser AST node kind must not be empty".to_string());
+    }
+    let start = get_required("start")?.extract::<usize>().map_err(|error| {
+        format!("Python parser AST node start must be a nonnegative integer: {error}")
+    })?;
+    let end = get_required("end")?.extract::<usize>().map_err(|error| {
+        format!("Python parser AST node end must be a nonnegative integer: {error}")
+    })?;
+    if start > end || end > source_length {
+        return Err(format!(
+            "Python parser AST node '{kind}' has invalid range {start}..{end} for {source_length} characters"
+        ));
+    }
+    if parent_range
+        .is_some_and(|(parent_start, parent_end)| start < parent_start || end > parent_end)
+    {
+        return Err(format!(
+            "Python parser AST node '{kind}' is outside its parent range"
+        ));
+    }
+    let capture = node
+        .get_item("capture")
+        .map_err(|error| error.to_string())?
+        .filter(|value| !value.is_none())
+        .map(|value| {
+            value.extract::<String>().map_err(|error| {
+                format!("Python parser AST node '{kind}' capture must be a string: {error}")
+            })
+        })
+        .transpose()?;
+    let children = node
+        .get_item("children")
+        .map_err(|error| error.to_string())?
+        .map(|children| {
+            children
+                .cast_into::<PyList>()
+                .map_err(|error| {
+                    format!("Python parser AST node '{kind}' children must be a list: {error}")
+                })?
+                .iter()
+                .map(|child| parse_ast_node(&child, source_length, depth + 1, Some((start, end))))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(AstNode {
+        kind,
+        start,
+        end,
+        capture,
+        children,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,38 +542,29 @@ mod tests {
         assert_eq!(languages.len(), 2);
         assert!(languages.iter().any(|language| {
             language.name == "rust"
-                && language.grammar == "rust"
                 && language.extensions == ["rs"]
                 && language
-                    .completion_server
+                    .language_server
                     .as_ref()
                     .is_some_and(|server| server.command == "rust-analyzer")
-                && language
-                    .function_nodes
-                    .contains(&"function_item".to_string())
-                && !language.capture_colors.is_empty()
+                && !language.highlight_colors.is_empty()
         }));
         assert!(languages.iter().any(|language| {
             language.name == "python"
-                && language.grammar == "python"
                 && language.extensions == ["py", "pyi"]
-                && language.completion_server.as_ref().is_some_and(|server| {
+                && language.language_server.as_ref().is_some_and(|server| {
                     server.command == "pyright-langserver" && server.arguments == ["--stdio"]
                 })
-                && language
-                    .function_nodes
-                    .contains(&"function_definition".to_string())
         }));
     }
 
     #[test]
-    fn python_can_register_language_extensions_and_syntax_queries() {
+    fn python_can_register_language_parser_ast_and_text_object_kinds() {
         let runtime = PythonRuntime::new().unwrap();
         Python::attach(|py| {
             let module = runtime.module.bind(py);
             let source = CString::new(
-                "register_language('rust-test', 'rust', ('rsx',), \
-                 builtin_highlights_query('rust'), ('function_item',), {})",
+                "def parse_test(source):\n    return ast_node('module', 0, len(source), [\n        ast_node('function', 0, len(source), [\n            ast_node('keyword', 0, 2, capture='keyword')\n        ])\n    ])\nregister_language('rust-test', ('rsx',), parser=parse_test,\n    highlight_colors={'keyword': (0.7, 0.4, 0.9, 2)},\n    text_object_kinds=('function',))",
             )
             .unwrap();
             py.run(source.as_c_str(), Some(&module.dict()), None)
@@ -461,9 +576,145 @@ mod tests {
             .iter()
             .find(|language| language.name == "rust-test")
             .unwrap();
-        assert_eq!(custom.grammar, "rust");
         assert_eq!(custom.extensions, ["rsx"]);
-        assert!(custom.function_nodes.contains(&"function_item".to_string()));
+        assert!(custom.highlight_colors.contains_key("keyword"));
+        assert_eq!(custom.text_object_kinds, ["function"]);
+
+        let tree = runtime.parse_syntax("rust-test", "fn").unwrap().unwrap();
+        assert_eq!(tree.kind, "module");
+        assert_eq!(tree.children[0].kind, "function");
+        assert_eq!(
+            tree.children[0].children[0].capture.as_deref(),
+            Some("keyword")
+        );
+    }
+
+    fn captured_text(tree: &AstNode, source: &str, capture: &str) -> Vec<String> {
+        let mut texts = Vec::new();
+        let mut stack = vec![tree];
+        while let Some(node) = stack.pop() {
+            if node.capture.as_deref() == Some(capture) {
+                texts.push(
+                    source
+                        .chars()
+                        .skip(node.start)
+                        .take(node.end - node.start)
+                        .collect(),
+                );
+            }
+            stack.extend(&node.children);
+        }
+        texts
+    }
+
+    fn text_object_at(tree: &AstNode, source: &str, needle: &str) -> Option<String> {
+        let cursor = source[..source.find(needle).unwrap()].chars().count();
+        tree.enclosing_text_object(cursor, &["function".to_string()])
+            .map(|(start, end)| source.chars().skip(start).take(end - start).collect())
+    }
+
+    #[test]
+    fn default_rust_parser_highlights_and_finds_functions() {
+        let runtime = PythonRuntime::new().unwrap();
+        let source = "// café\npub(crate) fn greet(name: &'a str) -> u8 {\n    let c = '\\n';\n    println!(\"hi {}\", name);\n    fn inner() -> i32 { MAX + 1 }\n    let s = r#\"fn fake() {\"#;\n    0\n}\n\ntrait Shape { fn area(&self) -> f64; }\n";
+        let tree = runtime.parse_syntax("rust", source).unwrap().unwrap();
+
+        assert_eq!(captured_text(&tree, source, "comment"), ["// café"]);
+        assert!(captured_text(&tree, source, "keyword").contains(&"fn".to_string()));
+        assert_eq!(captured_text(&tree, source, "macro"), ["println"]);
+        assert_eq!(captured_text(&tree, source, "character"), ["'\\n'"]);
+        assert_eq!(captured_text(&tree, source, "lifetime"), ["'a"]);
+        assert_eq!(captured_text(&tree, source, "constant"), ["MAX"]);
+        let mut functions = captured_text(&tree, source, "function");
+        functions.sort();
+        assert_eq!(functions, ["area", "greet", "inner"]);
+        let mut strings = captured_text(&tree, source, "string");
+        strings.sort();
+        assert_eq!(strings, ["\"hi {}\"", "r#\"fn fake() {\"#"]);
+
+        assert_eq!(
+            text_object_at(&tree, source, "MAX").as_deref(),
+            Some("fn inner() -> i32 { MAX + 1 }")
+        );
+        let outer = text_object_at(&tree, source, "println").unwrap();
+        assert!(outer.starts_with("pub(crate) fn greet"));
+        assert!(outer.ends_with("    0\n}"));
+        assert_eq!(
+            text_object_at(&tree, source, "area").as_deref(),
+            Some("fn area(&self) -> f64;")
+        );
+        assert_eq!(text_object_at(&tree, source, "trait"), None);
+    }
+
+    #[test]
+    fn default_python_parser_highlights_and_finds_functions() {
+        let runtime = PythonRuntime::new().unwrap();
+        let source = "import os\n\n@cache\nasync def outer(a, b=(1,\n2)):\n    \"\"\"Doc\nat column zero\"\"\"\n    label = 'café'  # note\n    total = a + \\\nb\n    def inner():\n        return label\n# dedented comment\n    return LIMIT, Point(1), None\n\nx = 1\n";
+        let tree = runtime.parse_syntax("python", source).unwrap().unwrap();
+
+        let mut comments = captured_text(&tree, source, "comment");
+        comments.sort();
+        assert_eq!(comments, ["# dedented comment", "# note"]);
+        let mut functions = captured_text(&tree, source, "function");
+        functions.sort();
+        assert_eq!(functions, ["inner", "outer"]);
+        let mut constants = captured_text(&tree, source, "constant");
+        constants.sort();
+        assert_eq!(constants, ["LIMIT", "None"]);
+        assert_eq!(captured_text(&tree, source, "type"), ["Point"]);
+        assert!(
+            captured_text(&tree, source, "string")
+                .contains(&"\"\"\"Doc\nat column zero\"\"\"".to_string())
+        );
+
+        assert_eq!(
+            text_object_at(&tree, source, "return label").as_deref(),
+            Some("def inner():\n        return label")
+        );
+        let outer = text_object_at(&tree, source, "label = ").unwrap();
+        assert!(outer.starts_with("async def outer"));
+        assert!(outer.ends_with("return LIMIT, Point(1), None"));
+        assert_eq!(text_object_at(&tree, source, "x = 1"), None);
+    }
+
+    #[test]
+    fn default_parsers_tolerate_incomplete_code() {
+        let runtime = PythonRuntime::new().unwrap();
+        for source in [
+            "",
+            "fn",
+            "def",
+            "fn broken( {",
+            "def broken(:\n    s = 'open",
+            "}}} fn a() { \"open",
+            "/* open",
+            "'''",
+            "r#\"",
+        ] {
+            for language in ["rust", "python"] {
+                runtime
+                    .parse_syntax(language, source)
+                    .unwrap_or_else(|error| panic!("{language} parser failed: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_python_parser_ast_ranges_are_reported() {
+        let runtime = PythonRuntime::new().unwrap();
+        Python::attach(|py| {
+            let module = runtime.module.bind(py);
+            let source = CString::new(
+                "register_language('invalid-test', ('bad',),\n\
+                 parser=lambda source: ast_node('root', 0, len(source) + 1))",
+            )
+            .unwrap();
+            py.run(source.as_c_str(), Some(&module.dict()), None)
+                .unwrap();
+        });
+
+        let error = runtime.parse_syntax("invalid-test", "x").unwrap_err();
+        assert!(error.contains("invalid range"));
     }
 
     #[test]

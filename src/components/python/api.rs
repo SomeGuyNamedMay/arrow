@@ -27,23 +27,34 @@ def bind_key(key, command, mode="normal"):
 def keybinding(key, command, mode="normal"):
     bind_key(key, command, mode)
 
-def register_language(name, grammar, extensions, highlights_query,
-                      function_nodes=(), capture_colors=None, completion_server=None):
-    """Register a compiled grammar's extensions, queries, and highlight styles.
+def register_language(name, extensions, parser=None, highlight_colors=None,
+                      text_object_kinds=(), language_server=None):
+    """Register a language parser, styling, text objects, and optional LSP.
 
-    Capture colors map query names to (red, green, blue, priority), with color
-    channels between 0.0 and 1.0. Grammar identifiers select parsers compiled
-    into Arrow; see builtin_highlights_query for available bundled queries.
-    completion_server may contain command, args, and root_markers.
+    parser receives source text and returns an ast_node tree (or None).
+    Node start/end offsets are zero-based Unicode character offsets, with an
+    exclusive end. highlight_colors maps capture names to
+    (red, green, blue, priority). text_object_kinds names selectable AST nodes.
+    language_server is optional and is used only for language-server features
+    such as completion.
     """
     syntax_languages[name] = {
         "name": name,
-        "grammar": grammar,
         "extensions": tuple(extensions),
-        "highlights_query": highlights_query,
-        "function_nodes": tuple(function_nodes),
-        "capture_colors": dict(capture_colors or {}),
-        "completion_server": completion_server,
+        "parser": parser,
+        "highlight_colors": dict(highlight_colors or {}),
+        "text_object_kinds": tuple(text_object_kinds),
+        "language_server": language_server,
+    }
+
+def ast_node(kind, start, end, children=(), capture=None):
+    """Build an AST node; offsets are Unicode character indices into source."""
+    return {
+        "kind": kind,
+        "start": start,
+        "end": end,
+        "children": list(children),
+        "capture": capture,
     }
 
 def dots():
@@ -194,17 +205,6 @@ fn run_command(name: &str) {
 }
 
 #[pyfunction]
-fn builtin_highlights_query(grammar: &str) -> PyResult<&'static str> {
-    match grammar {
-        "rust" => Ok(tree_sitter_rust::HIGHLIGHTS_QUERY),
-        "python" => Ok(tree_sitter_python::HIGHLIGHTS_QUERY),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "No built-in grammar named '{grammar}'"
-        ))),
-    }
-}
-
-#[pyfunction]
 fn arrow_set_dots(dots: Vec<(usize, Option<(usize, usize)>, bool)>) {
     let dots = dots
         .into_iter()
@@ -308,9 +308,6 @@ pub(super) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> Result<(
     module
         .add_function(wrap_pyfunction!(replace_ranges, py).unwrap())
         .map_err(|error| format!("Failed to register replace_ranges: {error}"))?;
-    module
-        .add_function(wrap_pyfunction!(builtin_highlights_query, py).unwrap())
-        .map_err(|error| format!("Failed to register builtin_highlights_query: {error}"))?;
     module.setattr("_editor_dots", PyList::empty(py)).unwrap();
     for function in [
         wrap_pyfunction!(close_file_explorer, py).unwrap(),

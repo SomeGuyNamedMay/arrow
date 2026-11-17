@@ -1,5 +1,5 @@
 use super::messages::AppMessage;
-use super::python_actions::{execute_python, sync_lsp_document};
+use super::python_actions::execute_python;
 use super::{keymap, state::Arrow};
 use crate::components::lsp::{CompletionCandidate, LspClient};
 use crate::components::text_editor::{Message, Mode};
@@ -21,10 +21,7 @@ pub(super) fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
             app.editor.update(Message::ScrollFrame);
         }
         AppMessage::ViewportHeight(height) => app.editor.set_viewport_height(height),
-        AppMessage::Editor(message) => {
-            app.editor.update(message);
-            sync_lsp_document(app);
-        }
+        AppMessage::Editor(message) => app.editor.update(message),
         AppMessage::Key { key, text } => {
             if !app.vertico.visible
                 && !app.explorer.visible
@@ -54,13 +51,13 @@ pub(super) fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
                 }
             } else if !app.explorer.visible {
                 app.editor.update(Message::Key { key, text });
-                sync_lsp_document(app);
             }
         }
         AppMessage::LspServerStarted { generation, result } => {
             if generation != app.lsp_generation {
                 return Task::none();
             }
+            app.lsp_start_pending = false;
             match result {
                 Ok(client) => {
                     let text = app.editor.buffer.to_string();
@@ -97,7 +94,74 @@ pub(super) fn update(app: &mut Arrow, message: AppMessage) -> Task<AppMessage> {
             }
         }
     }
+
+    let syntax_task = refresh_syntax(app);
+    let lsp_sync_task = synchronize_lsp_document(app);
+    let lsp_start_task = ensure_lsp_started(app);
+    Task::batch([syntax_task, lsp_sync_task, lsp_start_task])
+}
+
+fn refresh_syntax(app: &mut Arrow) -> Task<AppMessage> {
+    let source = app.editor.buffer.to_string();
+    if source == app.syntax_text {
+        return Task::none();
+    }
+    app.syntax_text.clone_from(&source);
+    let Some(config) = app.syntax_config.as_ref() else {
+        app.editor.clear_highlights();
+        return Task::none();
+    };
+    let Some(python) = app.python.as_ref() else {
+        app.editor.clear_highlights();
+        return Task::none();
+    };
+    match python.parse_syntax(&config.name, &source) {
+        Ok(tree) => app.editor.set_syntax_tree(tree, &config.highlight_colors),
+        Err(error) => {
+            app.editor.clear_highlights();
+            eprintln!("{error}");
+        }
+    }
     Task::none()
+}
+
+fn synchronize_lsp_document(app: &mut Arrow) -> Task<AppMessage> {
+    let text = app.editor.buffer.to_string();
+    if text != app.lsp_text
+        && let Some(lsp) = &app.lsp
+    {
+        app.lsp_version = app.lsp_version.saturating_add(1);
+        if let Err(error) = lsp.did_change(app.lsp_version, &text) {
+            eprintln!("{error}");
+        } else {
+            app.lsp_text = text;
+        }
+    }
+    Task::none()
+}
+
+fn ensure_lsp_started(app: &mut Arrow) -> Task<AppMessage> {
+    if app.lsp.is_some() || app.lsp_start_pending {
+        return Task::none();
+    }
+    let (Some(language), Some(path)) = (app.lsp_config.clone(), app.lsp_path.clone()) else {
+        return Task::none();
+    };
+    let Some(config) = language.language_server else {
+        return Task::none();
+    };
+    app.lsp_start_pending = true;
+    let generation = app.lsp_generation;
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                LspClient::start(config, &path, language.name).map(Arc::new)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("Language server startup failed: {error}")))
+        },
+        move |result| AppMessage::LspServerStarted { generation, result },
+    )
 }
 
 fn request_completion(app: &mut Arrow) -> Task<AppMessage> {
@@ -136,21 +200,11 @@ fn request_completion(app: &mut Arrow) -> Task<AppMessage> {
     if app.completion_pending {
         return Task::none();
     }
-    let (Some((language_id, config)), Some(path)) = (app.lsp_config.clone(), app.lsp_path.clone())
-    else {
+    if app.lsp_config.is_none() {
         return Task::none();
-    };
+    }
     app.completion_pending = true;
-    Task::perform(
-        async move {
-            tokio::task::spawn_blocking(move || {
-                LspClient::start(config, &path, language_id).map(Arc::new)
-            })
-            .await
-            .unwrap_or_else(|error| Err(format!("Language server startup failed: {error}")))
-        },
-        move |result| AppMessage::LspServerStarted { generation, result },
-    )
+    ensure_lsp_started(app)
 }
 
 fn show_completions(app: &mut Arrow, completions: Vec<CompletionCandidate>) {
