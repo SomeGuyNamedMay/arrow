@@ -1,0 +1,12 @@
+[package]
+name = "text-tools"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Example Arrow plugin: text commands, key bindings and event hooks."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.63.0"

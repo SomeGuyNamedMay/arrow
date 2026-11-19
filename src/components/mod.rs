@@ -1,6 +1,3 @@
-pub mod file_explorer;
-pub mod lsp;
-pub mod python;
-pub mod syntax;
+pub mod command_menu;
+pub mod keys;
 pub mod text_editor;
-pub mod vertico;

@@ -1,0 +1,12 @@
+[package]
+name = "arrow-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Arrow's built-in Kakoune-style modes, commands and key bindings."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.63.0"

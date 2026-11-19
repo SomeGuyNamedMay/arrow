@@ -1,0 +1,119 @@
+package arrow:plugin@0.4.0;
+
+interface types {
+    record selection {
+        anchor: u32,
+        /// The end that moves. Together with `anchor` it covers `min..=max`.
+        cursor: u32,
+    }
+
+    /// Kinds of events a plugin can subscribe to.
+    enum event-kind {
+        /// All plugins have loaded.
+        startup,
+        /// The buffer text changed.
+        buffer-changed,
+        /// A dot moved, changed size, or dots were added or removed.
+        selection-changed,
+        /// The editor switched modes.
+        mode-changed,
+        /// A named command ran (from a key binding, the command menu or a plugin).
+        command-executed,
+    }
+
+    variant event {
+        startup,
+        buffer-changed,
+        /// Carries the primary dot.
+        selection-changed(selection),
+        mode-changed(string),
+        command-executed(string),
+    }
+}
+
+/// The editor's storage: its text, its dots and its mode.
+///
+/// The host only stores these and draws them. It has no editing behaviour of its
+/// own: it doesn't move dots when the text changes, merge them, keep a final
+/// newline or record undo history. That is all up to plugins (see the core
+/// plugin). Its one rule is that dot positions are kept inside the text (pulled
+/// back to the last character if needed), so the view can always draw them.
+///
+/// Positions are character indices. Dots are the editor's cursors: each is a
+/// selection covering `min(anchor, cursor)..=max(anchor, cursor)`. They are kept
+/// in the order plugins set them, conventionally oldest first; the last one is
+/// the primary dot, which the view follows. There is always at least one.
+interface editor {
+    use types.{selection};
+
+    len: func() -> u32;
+    char-at: func(index: u32) -> option<char>;
+    /// Text in `start..end` (end exclusive).
+    slice: func(start: u32, end: u32) -> string;
+    /// Replace `start..end` (end exclusive) with `text`. Dots are not moved.
+    replace: func(start: u32, end: u32, text: string);
+
+    /// All dots, in order.
+    get-dots: func() -> list<selection>;
+    /// Replace every dot. An empty list is ignored.
+    set-dots: func(dots: list<selection>);
+    get-dot: func(index: u32) -> option<selection>;
+    set-dot: func(index: u32, selection: selection);
+    /// The primary (last) dot.
+    get-selection: func() -> selection;
+    set-selection: func(selection: selection);
+
+    get-mode: func() -> string;
+    /// Switch to a mode created with `define-mode`.
+    set-mode: func(mode: string) -> result<_, string>;
+
+    /// Show a message in the status bar until the next key press.
+    message: func(text: string);
+
+    /// Run any command by name after the current plugin call returns. Returns
+    /// false if no command has that name.
+    run-command: func(name: string) -> bool;
+}
+
+/// Adding modes, commands, key bindings and event hooks.
+interface registry {
+    use types.{event-kind};
+
+    /// Create a mode, or change its fallback. Characters typed in the mode with
+    /// no binding run `fallback` with the character (e.g. self-insert); modes
+    /// with a fallback draw a typing cursor. The editor starts in "normal".
+    define-mode: func(name: string, fallback: option<string>);
+
+    /// Add a command to the command menu. When it runs, the host calls this
+    /// plugin's `run-command`. If `takes-char` is set, the host first waits for a
+    /// typed character and passes it as the argument (like Kakoune's `r`).
+    /// Registering an existing name replaces it.
+    register-command: func(name: string, description: string, takes-char: bool);
+
+    /// Bind a key sequence to any command, in Kakoune notation: "gh", "<a-s>",
+    /// "<space>d", "<esc>". Rebinding a sequence replaces it.
+    bind-key: func(mode: string, keys: string, command: string) -> result<_, string>;
+
+    /// Label a prefix key for the status-bar hint, e.g. "g" -> "goto".
+    name-prefix: func(mode: string, keys: string, label: string) -> result<_, string>;
+
+    /// Have `on-event` called for every event of this kind.
+    subscribe: func(event: event-kind);
+}
+
+world plugin {
+    import editor;
+    import registry;
+    use types.{event};
+
+    /// Called once when the plugin loads. Register modes, commands, keys and
+    /// hooks here.
+    export init: func();
+
+    /// Run one of the commands this plugin registered.
+    export run-command: func(name: string, arg: option<char>);
+
+    /// Called for each event the plugin subscribed to. Edits made here don't
+    /// trigger further events.
+    export on-event: func(event: event);
+}
