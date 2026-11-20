@@ -8,8 +8,12 @@
 //! Each plugin gets its own store and instance, so plugins can't see each other's
 //! memory. During a plugin call the app's [`Core`] (the editor plus the registry)
 //! is moved into that plugin's store so the host functions can use it, then moved
-//! back. Calls run on the UI thread with a time limit (wasmtime epoch
-//! interruption); a plugin that traps or times out is disabled.
+//! back.
+//!
+//! Calls are async (wasmtime's `call_async`), so the app runs them off the UI
+//! thread. Every epoch tick a running plugin yields to the executor, and once its
+//! time limit is spent it is interrupted; a plugin that traps or times out is
+//! disabled.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -19,31 +23,57 @@ use std::{
 };
 
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use wasmtime::{Config, Engine, Store, UpdateDeadline};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
 
 use crate::components::keys::{KeyChord, format_keys, parse_keys};
+use crate::components::menu::{MenuItem, MenuSpec};
+use crate::components::tree_menu::{TreeNode, TreeSpec};
 use crate::components::text_editor::{Selection, TextEditor};
 
 wasmtime::component::bindgen!({
     world: "plugin",
     path: "wit",
+    exports: { default: async },
 });
 
-use self::arrow::plugin::{editor as host_editor, registry as host_registry, types};
+use self::arrow::plugin::{editor as host_editor, registry as host_registry, types, ui as host_ui};
 // `Event` is already defined at this level by bindgen, because the world `use`s it.
 pub use self::arrow::plugin::types::EventKind;
 
 /// Plugins built from `plugins/` by `build.rs` and embedded in the executable.
 /// Core loads first so the others can bind its commands.
-const BUNDLED: &[(&str, &[u8])] = &[
-    ("core", include_bytes!(concat!(env!("OUT_DIR"), "/arrow_core.wasm"))),
-    ("text-tools", include_bytes!(concat!(env!("OUT_DIR"), "/text_tools.wasm"))),
+const BUNDLED: &[(&str, &[u8], Access)] = &[
+    (
+        "core",
+        include_bytes!(concat!(env!("OUT_DIR"), "/arrow_core.wasm")),
+        Access::None,
+    ),
+    (
+        "text-tools",
+        include_bytes!(concat!(env!("OUT_DIR"), "/text_tools.wasm")),
+        Access::None,
+    ),
+    (
+        "files",
+        include_bytes!(concat!(env!("OUT_DIR"), "/files.wasm")),
+        Access::ReadWorkingDir,
+    ),
 ];
+
+/// What a plugin may reach outside its sandbox.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Nothing but stdout and stderr (for `println!` debugging).
+    None,
+    /// Also read, but not write, the directory Arrow was started in. Inside the
+    /// plugin it is the current directory, ".".
+    ReadWorkingDir,
+}
 
 /// How often the epoch counter advances.
 const TICK: Duration = Duration::from_millis(10);
-/// Time limit for a command or event hook: about half a second.
+/// Time limit for a command or event hook: about half a second of ticks.
 const CALL_TICKS: u64 = 50;
 /// Time limit for a plugin's `init`: about five seconds.
 const INIT_TICKS: u64 = 500;
@@ -75,7 +105,7 @@ fn bundled_components() -> &'static [(&'static str, Result<Component, String>)] 
     COMPILED.get_or_init(|| {
         BUNDLED
             .iter()
-            .map(|(name, bytes)| {
+            .map(|(name, bytes, _)| {
                 let component = Component::new(engine(), bytes)
                     .map_err(|e| format!("plugin `{name}` failed to compile: {e:#}"));
                 (*name, component)
@@ -130,22 +160,13 @@ pub struct Registry {
     /// Labels for prefix keys, keyed by mode and keys.
     prefix_labels: HashMap<(String, Vec<KeyChord>), String>,
     subscriptions: Vec<(usize, EventKind)>,
+    /// Names of loaded plugins, by index.
+    plugin_names: Vec<String>,
 }
 
 impl Registry {
     pub fn command(&self, name: &str) -> Option<&PluginCommand> {
         self.commands.get(name)
-    }
-
-    /// Plugin commands as (name, command), sorted by name.
-    pub fn commands(&self) -> Vec<(&str, &PluginCommand)> {
-        let mut commands: Vec<_> = self
-            .commands
-            .iter()
-            .map(|(name, command)| (name.as_str(), command))
-            .collect();
-        commands.sort_unstable_by_key(|(name, _)| *name);
-        commands
     }
 
     pub fn has_mode(&self, mode: &str) -> bool {
@@ -235,15 +256,52 @@ pub struct Core {
     pub registry: Registry,
     /// Events waiting to be delivered.
     pub events: VecDeque<Event>,
-    /// Commands plugins asked to run once their current call returns.
-    pub queued_commands: VecDeque<String>,
-    /// Commands provided by the app itself rather than a plugin (like `quit`).
-    pub app_commands: Vec<&'static str>,
+    /// Commands (with arguments) plugins asked to run once their call returns.
+    pub queued_commands: VecDeque<(String, Option<String>)>,
+    /// A menu a plugin asked to show once its call returns.
+    pub menu_request: Option<MenuSpec>,
+    /// A tree menu a plugin asked to show once its call returns.
+    pub tree_request: Option<TreeSpec>,
+    /// Nodes plugins added to the open tree menu, as (parent, nodes).
+    pub tree_additions: Vec<(Option<String>, Vec<TreeNode>)>,
+    /// Commands provided by the app itself rather than a plugin (like `quit`), as
+    /// (name, description).
+    pub app_commands: Vec<(&'static str, &'static str)>,
 }
 
 impl Core {
     pub fn is_command(&self, name: &str) -> bool {
-        self.registry.command(name).is_some() || self.app_commands.contains(&name)
+        self.registry.command(name).is_some() || self.is_app_command(name)
+    }
+
+    pub fn is_app_command(&self, name: &str) -> bool {
+        self.app_commands.iter().any(|(n, _)| *n == name)
+    }
+
+    /// Every command plugins and the app provide, sorted by name.
+    fn list_commands(&self) -> Vec<types::CommandInfo> {
+        let registry = &self.registry;
+        let plugin_commands = registry.commands.iter().map(|(name, command)| types::CommandInfo {
+            name: name.clone(),
+            description: command.description.clone(),
+            plugin: registry
+                .plugin_names
+                .get(command.plugin)
+                .cloned()
+                .unwrap_or_default(),
+            binding: registry.binding_for(name),
+            takes_char: command.takes_char,
+        });
+        let app_commands = self.app_commands.iter().map(|(name, description)| types::CommandInfo {
+            name: name.to_string(),
+            description: description.to_string(),
+            plugin: "app".to_string(),
+            binding: registry.binding_for(name),
+            takes_char: false,
+        });
+        let mut commands: Vec<_> = plugin_commands.chain(app_commands).collect();
+        commands.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        commands
     }
 }
 
@@ -253,6 +311,8 @@ impl Core {
 pub struct HostState {
     core: Option<Core>,
     plugin: usize,
+    /// Epoch ticks the current call may still run for.
+    ticks_left: u64,
     wasi: WasiCtx,
     table: ResourceTable,
 }
@@ -347,6 +407,14 @@ impl host_editor::Host for HostState {
         self.core().editor.editor().mode().to_string()
     }
 
+    fn get_buffer_name(&mut self) -> String {
+        self.core().editor.editor().name().to_string()
+    }
+
+    fn set_buffer_name(&mut self, name: String) {
+        self.core().editor.editor_mut().set_name(name);
+    }
+
     fn set_mode(&mut self, mode: String) -> Result<(), String> {
         let core = self.core();
         if !core.registry.has_mode(&mode) {
@@ -361,15 +429,62 @@ impl host_editor::Host for HostState {
         self.core().editor.editor_mut().set_message(text);
     }
 
-    fn run_command(&mut self, name: String) -> bool {
+    fn run_command(&mut self, name: String, arg: Option<String>) -> bool {
         // Always queued: running another plugin's command now could call back into
         // the plugin that is still running, which components don't allow.
         let core = self.core();
         let exists = core.is_command(&name);
         if exists {
-            core.queued_commands.push_back(name);
+            core.queued_commands.push_back((name, arg));
         }
         exists
+    }
+}
+
+impl From<types::TreeNode> for TreeNode {
+    fn from(node: types::TreeNode) -> Self {
+        TreeNode {
+            label: node.label,
+            value: node.value,
+            annotation: node.annotation,
+            detail: node.detail,
+            parent: node.parent,
+            branch: node.branch,
+        }
+    }
+}
+
+impl host_ui::Host for HostState {
+    fn open_tree_menu(&mut self, menu: types::TreeMenu) {
+        self.core().tree_request = Some(TreeSpec {
+            title: menu.title,
+            nodes: menu.nodes.into_iter().map(TreeNode::from).collect(),
+            on_select: menu.on_select,
+            on_expand: menu.on_expand,
+        });
+    }
+
+    fn add_tree_nodes(&mut self, parent: Option<String>, nodes: Vec<types::TreeNode>) {
+        let nodes = nodes.into_iter().map(TreeNode::from).collect();
+        self.core().tree_additions.push((parent, nodes));
+    }
+
+    fn open_menu(&mut self, menu: types::Menu) {
+        self.core().menu_request = Some(MenuSpec {
+            prompt: menu.prompt,
+            input: menu.input,
+            items: menu
+                .items
+                .into_iter()
+                .map(|item| MenuItem {
+                    label: item.label,
+                    value: item.value,
+                    annotation: item.annotation,
+                    detail: item.detail,
+                })
+                .collect(),
+            on_select: menu.on_select,
+        });
     }
 }
 
@@ -411,6 +526,23 @@ impl host_registry::Host for HostState {
             subscriptions.push((plugin, event));
         }
     }
+
+    fn list_commands(&mut self) -> Vec<types::CommandInfo> {
+        self.core().list_commands()
+    }
+
+    fn list_bindings(&mut self) -> Vec<types::BindingInfo> {
+        self.core()
+            .registry
+            .bindings
+            .iter()
+            .map(|binding| types::BindingInfo {
+                mode: binding.mode.clone(),
+                keys: format_keys(&binding.keys),
+                command: binding.command.clone(),
+            })
+            .collect()
+    }
 }
 
 // ----- Loading and calling plugins -----
@@ -431,7 +563,7 @@ pub struct PluginHost {
 impl PluginHost {
     pub fn new() -> Self {
         let mut linker = Linker::new(engine());
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).expect("WASI links");
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("WASI links");
         Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .expect("plugin interfaces link");
         Self {
@@ -440,16 +572,14 @@ impl PluginHost {
         }
     }
 
-    pub fn name(&self, plugin: usize) -> &str {
-        &self.plugins[plugin].name
-    }
-
-    pub fn load_bundled(&mut self, core: &mut Core) -> Vec<String> {
+    pub async fn load_bundled(&mut self, core: &mut Core) -> Vec<String> {
         let mut errors = Vec::new();
-        for (name, component) in bundled_components() {
-            let result = component
-                .clone()
-                .and_then(|component| self.load(name, &component, core));
+        let access = BUNDLED.iter().map(|(_, _, access)| *access);
+        for ((name, component), access) in bundled_components().iter().zip(access) {
+            let result = match component {
+                Ok(component) => self.load(name, component, core, access).await,
+                Err(error) => Err(error.clone()),
+            };
             if let Err(error) = result {
                 errors.push(error);
             }
@@ -458,7 +588,7 @@ impl PluginHost {
     }
 
     /// Load every `*.wasm` in the user plugin directory, in name order.
-    pub fn load_user_plugins(&mut self, core: &mut Core) -> Vec<String> {
+    pub async fn load_user_plugins(&mut self, core: &mut Core) -> Vec<String> {
         let Some(dir) = user_plugin_dir() else {
             return Vec::new();
         };
@@ -470,38 +600,65 @@ impl PluginHost {
             .filter(|path| path.extension().is_some_and(|ext| ext == "wasm"))
             .collect();
         paths.sort();
-        paths
-            .iter()
-            .filter_map(|path| self.load_file(path, core).err())
-            .collect()
+        let mut errors = Vec::new();
+        for path in &paths {
+            if let Err(error) = self.load_file(path, core).await {
+                errors.push(error);
+            }
+        }
+        errors
     }
 
-    fn load_file(&mut self, path: &Path, core: &mut Core) -> Result<(), String> {
+    async fn load_file(&mut self, path: &Path, core: &mut Core) -> Result<(), String> {
         let name = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         let component =
             Component::from_file(engine(), path).map_err(|e| format!("plugin `{name}`: {e:#}"))?;
-        self.load(&name, &component, core)
+        // User plugins get no access outside their sandbox.
+        self.load(&name, &component, core, Access::None).await
     }
 
     /// Instantiate a plugin and run its `init`.
-    fn load(&mut self, name: &str, component: &Component, core: &mut Core) -> Result<(), String> {
-        // Plugins get no filesystem, network or environment; only stdout and stderr
-        // so `println!` debugging works.
-        let wasi = WasiCtx::builder().inherit_stdout().inherit_stderr().build();
+    async fn load(
+        &mut self,
+        name: &str,
+        component: &Component,
+        core: &mut Core,
+        access: Access,
+    ) -> Result<(), String> {
+        // No network or environment; stdout and stderr so `println!` debugging
+        // works; and a read-only view of the working directory if granted.
+        let mut wasi = WasiCtx::builder();
+        wasi.inherit_stdout().inherit_stderr();
+        if access == Access::ReadWorkingDir {
+            wasi.preopened_dir(".", ".", FsPerms::ReadOnly)
+                .map_err(|e| format!("plugin `{name}`: can't open the working directory: {e:#}"))?;
+        }
+        let wasi = wasi.build();
         let mut store = Store::new(
             engine(),
             HostState {
                 core: None,
                 plugin: self.plugins.len(),
+                ticks_left: INIT_TICKS,
                 wasi,
                 table: ResourceTable::new(),
             },
         );
-        store.set_epoch_deadline(INIT_TICKS);
-        let bindings = Plugin::instantiate(&mut store, component, &self.linker)
+        // Yield to the executor on every tick, until the call's ticks run out.
+        store.epoch_deadline_callback(|mut state| {
+            let ticks_left = &mut state.data_mut().ticks_left;
+            if *ticks_left == 0 {
+                return Ok(UpdateDeadline::Interrupt);
+            }
+            *ticks_left -= 1;
+            Ok(UpdateDeadline::Yield(1))
+        });
+        store.set_epoch_deadline(1);
+        let bindings = Plugin::instantiate_async(&mut store, component, &self.linker)
+            .await
             .map_err(|e| format!("plugin `{name}` failed to load: {e:#}"))?;
         self.plugins.push(LoadedPlugin {
             name: name.to_string(),
@@ -509,36 +666,32 @@ impl PluginHost {
             bindings,
             failed: false,
         });
+        core.registry.plugin_names.push(name.to_string());
         let index = self.plugins.len() - 1;
-        self.call(index, core, INIT_TICKS, |plugin, store| plugin.call_init(store))
+        self.call(index, core, Call::Init).await
     }
 
-    pub fn run_command(
+    pub async fn run_command(
         &mut self,
         plugin: usize,
         core: &mut Core,
         name: &str,
-        arg: Option<char>,
+        arg: Option<&str>,
     ) -> Result<(), String> {
-        self.call(plugin, core, CALL_TICKS, |plugin, store| {
-            plugin.call_run_command(store, name, arg)
-        })
+        self.call(plugin, core, Call::Command(name, arg)).await
     }
 
-    pub fn send_event(&mut self, plugin: usize, core: &mut Core, event: &Event) -> Result<(), String> {
-        self.call(plugin, core, CALL_TICKS, |plugin, store| {
-            plugin.call_on_event(store, event)
-        })
+    pub async fn send_event(
+        &mut self,
+        plugin: usize,
+        core: &mut Core,
+        event: &Event,
+    ) -> Result<(), String> {
+        self.call(plugin, core, Call::Event(event)).await
     }
 
     /// Lend `core` to a plugin for one call.
-    fn call(
-        &mut self,
-        index: usize,
-        core: &mut Core,
-        ticks: u64,
-        f: impl FnOnce(&Plugin, &mut Store<HostState>) -> wasmtime::Result<()>,
-    ) -> Result<(), String> {
+    async fn call(&mut self, index: usize, core: &mut Core, call: Call<'_>) -> Result<(), String> {
         let plugin = &mut self.plugins[index];
         if plugin.failed {
             return Err(format!(
@@ -546,9 +699,19 @@ impl PluginHost {
                 plugin.name
             ));
         }
-        plugin.store.data_mut().core = Some(std::mem::take(core));
-        plugin.store.set_epoch_deadline(ticks);
-        let result = f(&plugin.bindings, &mut plugin.store);
+        let state = plugin.store.data_mut();
+        state.core = Some(std::mem::take(core));
+        state.ticks_left = match call {
+            Call::Init => INIT_TICKS,
+            Call::Command(..) | Call::Event(_) => CALL_TICKS,
+        };
+        plugin.store.set_epoch_deadline(1);
+        let (bindings, store) = (&plugin.bindings, &mut plugin.store);
+        let result = match call {
+            Call::Init => bindings.call_init(store).await,
+            Call::Command(name, arg) => bindings.call_run_command(store, name, arg).await,
+            Call::Event(event) => bindings.call_on_event(store, event).await,
+        };
         *core = plugin
             .store
             .data_mut()
@@ -560,4 +723,11 @@ impl PluginHost {
             format!("plugin `{}` failed and was disabled: {e:#}", plugin.name)
         })
     }
+}
+
+/// One call into a plugin.
+enum Call<'a> {
+    Init,
+    Command(&'a str, Option<&'a str>),
+    Event(&'a Event),
 }

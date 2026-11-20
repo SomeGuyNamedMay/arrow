@@ -1,22 +1,32 @@
-//! A Vertico-style command menu: a minibuffer prompt above a vertical list of
-//! candidates that is filtered as you type.
+//! A generic Vertico-style menu: a minibuffer prompt above a vertical list of
+//! items that is filtered as you type.
 //!
-//! Matching works like Vertico with `orderless`: the input is split on spaces and a
-//! candidate matches when its name contains every part, in any order. Recently run
-//! commands sort first, then shorter names, then alphabetically.
+//! It knows nothing about what it lists. Plugins open it with a [`MenuSpec`] (the
+//! command menu, and later things like LSP completions) and get the chosen item's
+//! value back through the spec's `on_select` command.
+//!
+//! Matching works like Vertico with `orderless`: the input is split on spaces and
+//! an item matches when its label contains every part, in any order. Items keep
+//! the order the plugin gave them, except that an exact match moves to the top,
+//! so ranking is up to the plugin.
 
-use iced::widget::text::{LineHeight, Span};
+use iced::widget::text::{LineHeight, Span, Wrapping};
 use iced::widget::{Column, column, container, rich_text, row, span, text};
 use iced::{Color, Element, Fill, Font, Length};
 
 use super::keys::{EditorKey, KeyPress};
 
-/// Candidates shown at once, like `vertico-count`.
+/// Items shown at once, like `vertico-count`.
 const ROWS: usize = 10;
 const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT: f32 = 20.0;
-const NAME_WIDTH: f32 = 260.0;
-const BINDING_WIDTH: f32 = 70.0;
+/// Narrowest the label and annotation columns get. They widen to fit the longest
+/// entry in the menu.
+const MIN_LABEL_WIDTH: f32 = 260.0;
+const MIN_ANNOTATION_WIDTH: f32 = 70.0;
+/// Approximate width of one character in the monospace font, for sizing columns.
+const CHAR_WIDTH: f32 = FONT_SIZE * 0.62;
+const COLUMN_GAP: f32 = 16.0;
 
 const BACKGROUND: Color = Color::from_rgb8(24, 25, 32);
 const TEXT: Color = Color::from_rgb8(220, 220, 225);
@@ -26,52 +36,73 @@ const MATCH: Color = Color::from_rgb8(255, 196, 92);
 const SELECTED_ROW: Color = Color::from_rgb8(50, 56, 82);
 const CURSOR: Color = Color::from_rgb8(220, 220, 225);
 
-#[derive(Debug, Clone)]
-pub struct Candidate {
-    pub name: String,
-    pub description: String,
-    /// Key binding shown next to the name, like Emacs shows in `M-x`.
-    pub binding: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuItem {
+    /// Shown first, and what the input is matched against.
+    pub label: String,
+    /// Handed back when the item is chosen.
+    pub value: String,
+    /// Shown highlighted in its own column (a key binding, a completion kind).
+    pub annotation: String,
+    /// Shown dimmed after it (a description, a type signature).
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuSpec {
+    pub prompt: String,
+    /// Input to start with.
+    pub input: String,
+    /// In ranking order.
+    pub items: Vec<MenuItem>,
+    /// Command to run with the chosen item's value.
+    pub on_select: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// The user chose this command.
-    Execute(String),
+    /// An item was chosen: run `command` with `value`.
+    Selected { command: String, value: String },
     /// The menu was dismissed.
     Closed,
 }
 
-#[derive(Default)]
-pub struct CommandMenu {
-    open: bool,
+#[derive(Clone, Default)]
+pub struct Menu {
+    /// The open menu, if any.
+    spec: Option<MenuSpec>,
     input: String,
-    candidates: Vec<Candidate>,
-    /// Indices into `candidates` that match `input`, best first.
+    /// Indices into the spec's items that match `input`, in display order.
     matches: Vec<usize>,
     /// Index into `matches`.
     selected: usize,
     /// First visible row of `matches`.
     scroll: usize,
-    /// Names of executed commands, most recent first.
-    history: Vec<String>,
 }
 
-impl CommandMenu {
+impl Menu {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn is_open(&self) -> bool {
-        self.open
+        self.spec.is_some()
     }
 
-    /// Open the menu with an empty prompt over `candidates`.
-    pub fn open(&mut self, candidates: Vec<Candidate>) {
-        self.open = true;
-        self.input.clear();
-        self.candidates = candidates;
+    /// Open a menu, replacing any that is open.
+    pub fn open(&mut self, spec: MenuSpec) {
+        self.input = spec.input.clone();
+        self.spec = Some(spec);
         self.refilter();
+    }
+
+    /// Items matching the current input, in display order.
+    #[cfg(test)]
+    pub fn matching_items(&self) -> Vec<&MenuItem> {
+        let Some(spec) = &self.spec else {
+            return Vec::new();
+        };
+        self.matches.iter().map(|&i| &spec.items[i]).collect()
     }
 
     /// Handle a key while the menu is open. Returns an event when the menu closes.
@@ -82,20 +113,21 @@ impl CommandMenu {
             EditorKey::Char('g') if ctrl => return Some(self.close()),
             EditorKey::Enter => {
                 // With nothing matching, Enter does nothing and the menu stays open.
-                let name = self.selected_candidate()?.name.clone();
-                self.close();
-                self.history.retain(|entry| *entry != name);
-                self.history.insert(0, name.clone());
-                return Some(Event::Execute(name));
+                let value = self.selected_item()?.value.clone();
+                let spec = self.spec.take()?;
+                return Some(Event::Selected {
+                    command: spec.on_select,
+                    value,
+                });
             }
             EditorKey::Up => self.select_by(-1),
             EditorKey::Down => self.select_by(1),
             EditorKey::Char('p') if ctrl => self.select_by(-1),
             EditorKey::Char('n') if ctrl => self.select_by(1),
-            // Like minibuffer completion: fill the prompt with the selected name.
+            // Like minibuffer completion: fill the input with the selected label.
             EditorKey::Tab => {
-                if let Some(candidate) = self.selected_candidate() {
-                    self.input = candidate.name.clone();
+                if let Some(item) = self.selected_item() {
+                    self.input = item.label.clone();
                     self.refilter();
                 }
             }
@@ -118,14 +150,13 @@ impl CommandMenu {
     }
 
     fn close(&mut self) -> Event {
-        self.open = false;
+        self.spec = None;
         Event::Closed
     }
 
-    fn selected_candidate(&self) -> Option<&Candidate> {
-        self.matches
-            .get(self.selected)
-            .map(|&index| &self.candidates[index])
+    fn selected_item(&self) -> Option<&MenuItem> {
+        let spec = self.spec.as_ref()?;
+        self.matches.get(self.selected).map(|&i| &spec.items[i])
     }
 
     fn select_by(&mut self, delta: isize) {
@@ -149,25 +180,25 @@ impl CommandMenu {
     }
 
     fn refilter(&mut self) {
+        let Some(spec) = &self.spec else {
+            return;
+        };
         let terms = self.terms();
         let exact = self.input.trim().to_lowercase();
-        let history = &self.history;
-        let candidates = &self.candidates;
-
-        let mut matches: Vec<usize> = (0..candidates.len())
+        let mut matches: Vec<usize> = (0..spec.items.len())
             .filter(|&i| {
-                let name = candidates[i].name.to_lowercase();
-                terms.iter().all(|term| name.contains(term.as_str()))
+                let label = spec.items[i].label.to_lowercase();
+                terms.iter().all(|term| label.contains(term.as_str()))
             })
             .collect();
-        matches.sort_by_key(|&i| {
-            let name = &candidates[i].name;
-            let recent = history
-                .iter()
-                .position(|entry| entry == name)
-                .unwrap_or(usize::MAX);
-            (name.to_lowercase() != exact, recent, name.len(), name.clone())
-        });
+        // Keep the plugin's order, but put an exact match first.
+        if let Some(position) = matches
+            .iter()
+            .position(|&i| spec.items[i].label.to_lowercase() == exact)
+        {
+            let exact_match = matches.remove(position);
+            matches.insert(0, exact_match);
+        }
 
         self.matches = matches;
         self.selected = 0;
@@ -175,6 +206,9 @@ impl CommandMenu {
     }
 
     pub fn view<'a, Message: 'a>(&'a self) -> Element<'a, Message> {
+        let Some(spec) = &self.spec else {
+            return column![].into();
+        };
         let position = if self.matches.is_empty() {
             0
         } else {
@@ -182,7 +216,7 @@ impl CommandMenu {
         };
         let prompt = rich_text(vec![
             span(format!("{position}/{} ", self.matches.len())).color(DIM),
-            span("M-x ").color(PROMPT),
+            span(format!("{} ", spec.prompt)).color(PROMPT),
             span(self.input.clone()).color(TEXT),
             // Block cursor at the end of the input.
             span(" ").background(CURSOR),
@@ -190,6 +224,21 @@ impl CommandMenu {
         .font(Font::MONOSPACE)
         .size(FONT_SIZE)
         .line_height(line_height());
+
+        // Size the columns to the longest entry so they line up without wrapping.
+        let column_width = |longest: usize, min: f32| {
+            (longest as f32 * CHAR_WIDTH + COLUMN_GAP).max(min)
+        };
+        let longest = |f: fn(&MenuItem) -> &str| {
+            spec.items
+                .iter()
+                .map(|item| f(item).chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let label_width = column_width(longest(|item| &item.label), MIN_LABEL_WIDTH);
+        let annotation_width =
+            column_width(longest(|item| &item.annotation), MIN_ANNOTATION_WIDTH);
 
         let terms = self.terms();
         let rows: Vec<Element<'a, Message>> = if self.matches.is_empty() {
@@ -201,17 +250,18 @@ impl CommandMenu {
                 .skip(self.scroll)
                 .take(ROWS)
                 .map(|(row_index, &index)| {
-                    let candidate = &self.candidates[index];
-                    let name = rich_text(highlighted(&candidate.name, &terms))
+                    let item = &spec.items[index];
+                    let name = rich_text(highlighted(&item.label, &terms))
                         .font(Font::MONOSPACE)
                         .size(FONT_SIZE)
                         .line_height(line_height())
-                        .width(Length::Fixed(NAME_WIDTH));
+                        .wrapping(Wrapping::None)
+                        .width(Length::Fixed(label_width));
                     let content = row![
                         name,
-                        label(candidate.binding.clone(), PROMPT)
-                            .width(Length::Fixed(BINDING_WIDTH)),
-                        label(candidate.description.clone(), DIM),
+                        label(item.annotation.clone(), PROMPT)
+                            .width(Length::Fixed(annotation_width)),
+                        label(item.detail.clone(), DIM),
                     ];
                     let selected = row_index == self.selected;
                     container(content)
@@ -247,12 +297,13 @@ fn label<'a>(content: String, color: Color) -> iced::widget::Text<'a> {
         .font(Font::MONOSPACE)
         .size(FONT_SIZE)
         .line_height(line_height())
+        .wrapping(Wrapping::None)
         .color(color)
 }
 
-/// Which characters of `name` match one of `terms` (case-insensitive).
-fn matched_chars(name: &str, terms: &[String]) -> Vec<bool> {
-    let lower: Vec<char> = name
+/// Which characters of `label` match one of `terms` (case-insensitive).
+fn matched_chars(label: &str, terms: &[String]) -> Vec<bool> {
+    let lower: Vec<char> = label
         .chars()
         .map(|c| c.to_lowercase().next().unwrap_or(c))
         .collect();
@@ -269,24 +320,24 @@ fn matched_chars(name: &str, terms: &[String]) -> Vec<bool> {
     marked
 }
 
-/// Spans for a candidate name with the matched parts highlighted.
-fn highlighted(name: &str, terms: &[String]) -> Vec<Span<'static, (), Font>> {
-    let marked = matched_chars(name, terms);
+/// Spans for an item label with the matched parts highlighted.
+fn highlighted(label: &str, terms: &[String]) -> Vec<Span<'static, (), Font>> {
+    let marked = matched_chars(label, terms);
     let mut spans = Vec::new();
     let mut run = String::new();
     let mut run_marked = marked.first().copied().unwrap_or(false);
-    for (c, &is_match) in name.chars().zip(&marked) {
+    for (c, &is_match) in label.chars().zip(&marked) {
         if is_match != run_marked {
-            spans.push(name_span(std::mem::take(&mut run), run_marked));
+            spans.push(label_span(std::mem::take(&mut run), run_marked));
             run_marked = is_match;
         }
         run.push(c);
     }
-    spans.push(name_span(run, run_marked));
+    spans.push(label_span(run, run_marked));
     spans
 }
 
-fn name_span(content: String, is_match: bool) -> Span<'static, (), Font> {
+fn label_span(content: String, is_match: bool) -> Span<'static, (), Font> {
     span(content).color(if is_match { MATCH } else { TEXT })
 }
 
@@ -294,80 +345,82 @@ fn name_span(content: String, is_match: bool) -> Span<'static, (), Font> {
 mod tests {
     use super::*;
 
-    fn candidate(name: &str) -> Candidate {
-        Candidate {
-            name: name.to_string(),
-            description: String::new(),
-            binding: String::new(),
+    fn item(label: &str) -> MenuItem {
+        MenuItem {
+            label: label.to_string(),
+            value: format!("value of {label}"),
+            annotation: String::new(),
+            detail: String::new(),
         }
     }
 
-    fn menu() -> CommandMenu {
-        let mut menu = CommandMenu::new();
-        menu.open(
-            ["select-all", "select-line", "delete-selection", "undo", "quit"]
+    fn menu() -> Menu {
+        let mut menu = Menu::new();
+        menu.open(MenuSpec {
+            prompt: "pick".into(),
+            input: String::new(),
+            items: ["select-line", "select-all", "delete-selection", "undo", "select"]
                 .into_iter()
-                .map(candidate)
+                .map(item)
                 .collect(),
-        );
+            on_select: "use-it".into(),
+        });
         menu
     }
 
-    fn type_text(menu: &mut CommandMenu, text: &str) {
+    fn type_text(menu: &mut Menu, text: &str) {
         for c in text.chars() {
             menu.handle_key(KeyPress::plain(EditorKey::Char(c)));
         }
     }
 
-    fn names(menu: &CommandMenu) -> Vec<&str> {
-        menu.matches
+    fn labels(menu: &Menu) -> Vec<&str> {
+        menu.matching_items()
             .iter()
-            .map(|&i| menu.candidates[i].name.as_str())
+            .map(|item| item.label.as_str())
             .collect()
     }
 
     #[test]
-    fn empty_input_sorts_by_length_then_name() {
+    fn keeps_the_given_order() {
         let menu = menu();
         assert_eq!(
-            names(&menu),
-            ["quit", "undo", "select-all", "select-line", "delete-selection"]
+            labels(&menu),
+            ["select-line", "select-all", "delete-selection", "undo", "select"]
         );
     }
 
     #[test]
-    fn terms_match_in_any_order() {
+    fn terms_match_in_any_order_and_exact_matches_come_first() {
         let mut menu = menu();
         type_text(&mut menu, "sel");
-        assert_eq!(names(&menu), ["select-all", "select-line", "delete-selection"]);
+        assert_eq!(
+            labels(&menu),
+            ["select-line", "select-all", "delete-selection", "select"]
+        );
+        type_text(&mut menu, "ect");
+        assert_eq!(labels(&menu)[0], "select");
         type_text(&mut menu, " del");
-        assert_eq!(names(&menu), ["delete-selection"]);
+        assert_eq!(labels(&menu), ["delete-selection"]);
         type_text(&mut menu, "x");
-        assert!(names(&menu).is_empty());
+        assert!(labels(&menu).is_empty());
         // Enter with no match keeps the menu open.
         assert_eq!(menu.handle_key(KeyPress::plain(EditorKey::Enter)), None);
         assert!(menu.is_open());
     }
 
     #[test]
-    fn navigate_and_execute() {
+    fn selecting_returns_the_value_and_command() {
         let mut menu = menu();
-        type_text(&mut menu, "select");
         menu.handle_key(KeyPress::plain(EditorKey::Down));
         assert_eq!(
             menu.handle_key(KeyPress::plain(EditorKey::Enter)),
-            Some(Event::Execute("select-line".into()))
+            Some(Event::Selected {
+                command: "use-it".into(),
+                value: "value of select-all".into(),
+            })
         );
         assert!(!menu.is_open());
-    }
-
-    #[test]
-    fn recent_commands_sort_first() {
-        let mut menu = menu();
-        type_text(&mut menu, "delete");
-        menu.handle_key(KeyPress::plain(EditorKey::Enter));
-        menu.open(menu.candidates.clone());
-        assert_eq!(names(&menu)[0], "delete-selection");
     }
 
     #[test]

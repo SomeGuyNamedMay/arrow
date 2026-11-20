@@ -6,7 +6,11 @@ use std::{env, path::PathBuf, process::Command};
 const PLUGIN_TARGET: &str = "wasm32-wasip2";
 /// Plugins to bundle: (crate name, directory under `plugins/`). Core comes first
 /// so the others can bind its commands.
-const BUNDLED: &[(&str, &str)] = &[("arrow-core", "core"), ("text-tools", "text-tools")];
+const BUNDLED: &[(&str, &str)] = &[
+    ("arrow-core", "core"),
+    ("text-tools", "text-tools"),
+    ("files", "files"),
+];
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());

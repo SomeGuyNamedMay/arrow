@@ -68,7 +68,7 @@ impl Guest for TextTools {
         }
     }
 
-    fn run_command(name: String, _arg: Option<char>) {
+    fn run_command(name: String, _arg: Option<String>) {
         match COMMANDS.iter().find(|(n, ..)| *n == name) {
             Some((.., run)) => run(),
             None => ed::message(&format!("text-tools has no command `{name}`")),

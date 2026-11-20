@@ -20,13 +20,17 @@ wit_bindgen::generate!({
 
 use arrow::plugin::editor as ed;
 use arrow::plugin::registry as reg;
-use arrow::plugin::types::Selection;
+use arrow::plugin::types::{Menu, MenuItem, Selection};
+use arrow::plugin::ui;
 
 struct Core;
 
 impl Guest for Core {
     fn init() {
         keep_final_newline();
+        // Start tracking from here, so edits other plugins make before our first
+        // command (like loading a file) can be undone.
+        remember_state();
         reg::define_mode("normal", None);
         reg::define_mode("insert", Some("insert-char"));
 
@@ -44,7 +48,8 @@ impl Guest for Core {
         let _ = reg::name_prefix("normal", "G", "extend to");
     }
 
-    fn run_command(name: String, arg: Option<char>) {
+    fn run_command(name: String, arg: Option<String>) {
+        let arg = arg.as_deref();
         let Some(command) = COMMANDS.iter().find(|c| c.name == name) else {
             ed::message(&format!("core has no command `{name}`"));
             return;
@@ -91,6 +96,8 @@ struct Snapshot {
 struct State {
     /// The yank register: one entry per dot that was yanked.
     register: Vec<String>,
+    /// Commands run from the command menu, most recent first.
+    recent_commands: Vec<String>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// State at the start of the current undo group, if one is open. A group
@@ -132,7 +139,14 @@ fn register_for_dot() -> Option<String> {
 
 // ----- Commands -----
 
-type Run = fn(Option<char>);
+/// A command's implementation. The argument is the typed character for
+/// `takes_char` commands, or the chosen value when a menu runs the command.
+type Run = fn(Option<&str>);
+
+/// The first character of an argument, for `takes_char` commands.
+fn first_char(arg: Option<&str>) -> Option<char> {
+    arg.and_then(|text| text.chars().next())
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
@@ -183,6 +197,21 @@ impl Command {
 }
 
 const COMMANDS: &[Command] = &[
+    // The command menu, built on the host's generic menu
+    Command::once("command-menu", "Pick a command to run", |_| open_command_menu()),
+    Command::once("execute-command", "Run the command named by the argument", |arg| {
+        if let Some(name) = arg {
+            execute_command(name);
+        }
+    }),
+    Command::once("describe-bindings", "List every key binding and what it does", |_| {
+        open_bindings_menu()
+    }),
+    Command::once("show-message", "Show the argument in the status bar", |arg| {
+        if let Some(text) = arg {
+            ed::message(text);
+        }
+    }),
     // Movement
     Command::each("move-left", "Move each dot left", |_| move_horizontal(false, false)),
     Command::each("move-right", "Move each dot right", |_| move_horizontal(true, false)),
@@ -262,8 +291,8 @@ const COMMANDS: &[Command] = &[
         let c = cursor().min(last());
         set_dot(c, c);
     }),
-    Command::each("insert-char", "Insert the typed character", |c| {
-        if let Some(c) = c {
+    Command::each("insert-char", "Insert the typed character", |arg| {
+        if let Some(c) = first_char(arg) {
             insert_at_cursor(&c.to_string());
         }
     })
@@ -315,8 +344,8 @@ const COMMANDS: &[Command] = &[
         edit(start, dot_end() + 1, &text);
         set_dot(start, start + char_count(&text).max(1) - 1);
     }),
-    Command::each("replace-chars", "Replace each selected character", |c| {
-        if let Some(c) = c {
+    Command::each("replace-chars", "Replace each selected character", |arg| {
+        if let Some(c) = first_char(arg) {
             map_dot_text(|x| if x == '\n' { x } else { c });
         }
     })
@@ -344,6 +373,7 @@ const NORMAL_BINDINGS: &[(&str, &str)] = &[
     // The command menu is part of the app; the key that opens it is ours.
     (":", "command-menu"),
     ("<a-x>", "command-menu"),
+    ("?", "describe-bindings"),
     // Dots
     ("c", "spawn-dot"),
     (",", "remove-oldest-dot"),
@@ -441,6 +471,102 @@ const INSERT_BINDINGS: &[(&str, &str)] = &[
 ];
 
 const INDENT: &str = "    ";
+
+// ----- The command menu -----
+
+/// Open the host's generic menu listing every command: recently run ones first,
+/// then shorter names, then alphabetically. Choosing one runs `execute-command`.
+fn open_command_menu() {
+    let recent = STATE.with(|s| s.borrow().recent_commands.clone());
+    let mut commands: Vec<_> = reg::list_commands()
+        .into_iter()
+        .filter(|command| command.name != "execute-command")
+        .collect();
+    commands.sort_by_key(|command| {
+        let rank = recent
+            .iter()
+            .position(|name| *name == command.name)
+            .unwrap_or(usize::MAX);
+        (rank, command.name.len(), command.name.clone())
+    });
+    let items = commands
+        .into_iter()
+        .map(|command| {
+            // Name the plugin, except for this one, which provides the basics.
+            let detail = if command.plugin == "core" {
+                command.description
+            } else {
+                format!("{} ({})", command.description, command.plugin)
+            };
+            MenuItem {
+                label: command.name.clone(),
+                value: command.name,
+                annotation: command.binding.unwrap_or_default(),
+                detail,
+            }
+        })
+        .collect();
+    ui::open_menu(&Menu {
+        prompt: "M-x".to_string(),
+        input: String::new(),
+        items,
+        on_select: "execute-command".to_string(),
+    });
+}
+
+/// Open the host's generic menu listing every key binding: normal mode first,
+/// then other modes, each in the order the bindings were made. Rows read
+/// "keys  command" so either can be searched; choosing one explains it.
+fn open_bindings_menu() {
+    let commands = reg::list_commands();
+    let mut bindings = reg::list_bindings();
+    // Stable sort: keeps the binding order within each mode.
+    bindings.sort_by_key(|binding| binding.mode != "normal");
+    let width = bindings
+        .iter()
+        .map(|binding| binding.keys.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let items = bindings
+        .into_iter()
+        .map(|binding| {
+            let command = commands.iter().find(|c| c.name == binding.command);
+            let description = match command {
+                Some(c) if c.plugin == "core" => c.description.clone(),
+                Some(c) => format!("{} ({})", c.description, c.plugin),
+                None => "unknown command".to_string(),
+            };
+            MenuItem {
+                label: format!("{:<width$}  {}", binding.keys, binding.command),
+                value: format!(
+                    "{} in {} mode runs {}: {}",
+                    binding.keys, binding.mode, binding.command, description
+                ),
+                annotation: binding.mode,
+                detail: description,
+            }
+        })
+        .collect();
+    ui::open_menu(&Menu {
+        prompt: "keys".to_string(),
+        input: String::new(),
+        items,
+        on_select: "show-message".to_string(),
+    });
+}
+
+/// Run the command chosen in the command menu, remembering it as recent.
+fn execute_command(name: &str) {
+    STATE.with(|s| {
+        let recent = &mut s.borrow_mut().recent_commands;
+        recent.retain(|entry| entry != name);
+        recent.insert(0, name.to_string());
+    });
+    if !ed::run_command(name, None) {
+        ed::message(&format!("no such command: {name}"));
+    }
+}
 
 // ----- Editing, merging and undo: the behaviour the host leaves to us -----
 

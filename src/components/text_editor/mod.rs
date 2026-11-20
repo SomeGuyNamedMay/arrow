@@ -7,9 +7,12 @@ mod editor;
 
 use std::cell::Cell;
 
+use std::f32::consts::FRAC_PI_2;
+
+use iced::gradient::{self, Gradient};
 use iced::widget::text::{LineHeight, Span, Wrapping};
 use iced::widget::{Column, column, container, responsive, rich_text, row, span, text};
-use iced::{Center, Color, Element, Fill, Font, Size};
+use iced::{Center, Color, Element, Fill, Font, Radians, Size};
 
 pub use editor::{Editor, Selection};
 
@@ -23,14 +26,18 @@ const TEXT: Color = Color::from_rgb8(220, 220, 225);
 const GUTTER: Color = Color::from_rgb8(95, 98, 115);
 /// Every dot is drawn the same way, cursor and selection alike.
 const DOT: Color = Color::from_rgb8(255, 196, 92);
+/// Colour of the insert-mode bars.
 const INSERT_DOT: Color = Color::from_rgb8(120, 200, 255);
+/// Width of an insert-mode bar, as a fraction of one character.
+const BAR_WIDTH: f32 = 0.2;
 const DOT_TEXT: Color = Color::from_rgb8(30, 31, 40);
 const MODELINE: Color = Color::from_rgb8(44, 46, 58);
 const MODELINE_TEXT: Color = Color::from_rgb8(170, 172, 185);
 const NORMAL_BADGE: Color = Color::from_rgb8(120, 200, 140);
 const INSERT_BADGE: Color = Color::from_rgb8(120, 200, 255);
 
-/// A modal, selection-first text editor modelled on Kakoune.
+/// A modal, selection-first text editor modelled on Kakoune. Cheap to clone.
+#[derive(Clone)]
 pub struct TextEditor {
     editor: Editor,
     /// First visible line. Adjusted while drawing to keep the cursor in view.
@@ -41,8 +48,11 @@ pub struct TextEditor {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Style {
     Plain,
-    /// Covered by a dot.
+    /// Covered by a dot (normal mode).
     Dot,
+    /// Just after a dot's insertion point (insert mode): a bar is drawn on its
+    /// left edge, between it and the character before.
+    Bar,
 }
 
 impl Default for TextEditor {
@@ -84,10 +94,10 @@ impl TextEditor {
     /// Draw only the lines that fit, scrolled so the cursor is visible.
     fn view_lines<'a, Message: 'a>(&'a self, size: Size) -> Element<'a, Message> {
         let rows = ((size.height / LINE_HEIGHT).floor() as usize).max(1);
-        let starts = self.editor.line_starts();
+        let line_count = self.editor.line_count();
         let (cursor_line, _) = self.editor.cursor_position();
 
-        let mut top = self.top_line.get().min(starts.len() - 1);
+        let mut top = self.top_line.get().min(line_count - 1);
         if cursor_line < top {
             top = cursor_line;
         } else if cursor_line >= top + rows {
@@ -95,11 +105,10 @@ impl TextEditor {
         }
         self.top_line.set(top);
 
-        let chars = self.editor.chars();
-        let gutter_width = starts.len().to_string().len();
-        let lines = starts.iter().enumerate().skip(top).take(rows).map(|(n, &start)| {
+        let gutter_width = line_count.to_string().len();
+        let lines = (top..line_count.min(top + rows)).map(|n| {
             // The line's newline, or one past the end if the text doesn't end with one.
-            let end = start + chars[start..].iter().position(|c| *c == '\n').unwrap_or(chars.len() - start);
+            let (start, end) = (self.editor.line_start(n), self.editor.line_end(n));
             let number = text(format!("{:>gutter_width$} ", n + 1))
                 .font(Font::MONOSPACE)
                 .size(FONT_SIZE)
@@ -119,7 +128,13 @@ impl TextEditor {
     /// Spans for one line (`start..=end`, where `end` is its newline), with every
     /// character a dot covers drawn the same way.
     fn line_spans(&self, start: usize, end: usize) -> Vec<Span<'static, (), Font>> {
-        let chars = self.editor.chars();
+        // The line itself, with its newline if it has one.
+        let chars: Vec<char> = self
+            .editor
+            .rope()
+            .slice(start..(end + 1).min(self.editor.len()))
+            .chars()
+            .collect();
         // Only the dots that touch this line matter.
         let dots: Vec<_> = self
             .editor
@@ -132,12 +147,19 @@ impl TextEditor {
         let inserting = self.editor.inserting();
 
         let style_of = |i: usize| {
-            let covered = if inserting {
-                dots.iter().any(|dot| dot.cursor == i)
+            if inserting {
+                // Text is typed before the cursor's character, so the bar goes
+                // on that character's left edge.
+                if dots.iter().any(|dot| dot.cursor == i) {
+                    Style::Bar
+                } else {
+                    Style::Plain
+                }
+            } else if dots.iter().any(|dot| dot.contains(i)) {
+                Style::Dot
             } else {
-                dots.iter().any(|dot| dot.contains(i))
-            };
-            if covered { Style::Dot } else { Style::Plain }
+                Style::Plain
+            }
         };
 
         let mut spans = Vec::new();
@@ -145,18 +167,20 @@ impl TextEditor {
         let mut run_style = style_of(start);
         for i in start..=end {
             let style = style_of(i);
-            if style != run_style {
-                spans.push(styled_span(std::mem::take(&mut run), run_style, inserting));
-                run_style = style;
+            // A bar is drawn across its span's left edge, so each bar character
+            // gets a span of its own.
+            if (style != run_style || style == Style::Bar) && !run.is_empty() {
+                spans.push(styled_span(std::mem::take(&mut run), run_style));
             }
+            run_style = style;
             // Show the newline (or the end of the text) as a space so it can carry
             // a dot.
-            run.push(match chars.get(i) {
+            run.push(match chars.get(i - start) {
                 Some('\n' | '\t') | None => ' ',
                 Some(&c) => c,
             });
         }
-        spans.push(styled_span(run, run_style, inserting));
+        spans.push(styled_span(run, run_style));
         spans
     }
 
@@ -176,7 +200,7 @@ impl TextEditor {
         container(
             row![
                 label(status).width(Fill),
-                label(format!("*scratch* {}:{}", line + 1, column + 1)),
+                label(format!("{} {}:{}", self.editor.name(), line + 1, column + 1)),
                 label(match self.editor.dots().len() {
                     1 => format!("{} sel", self.editor.selection().len()),
                     dots => format!("{dots} dots · {} sel", self.editor.selection().len()),
@@ -206,12 +230,30 @@ fn line_height() -> LineHeight {
     LineHeight::Absolute(LINE_HEIGHT.into())
 }
 
-fn styled_span(content: String, style: Style, inserting: bool) -> Span<'static, (), Font> {
+fn styled_span(content: String, style: Style) -> Span<'static, (), Font> {
     match style {
         Style::Plain => span(content),
-        Style::Dot => {
-            let color = if inserting { INSERT_DOT } else { DOT };
-            span(content).background(color).color(DOT_TEXT)
-        }
+        Style::Dot => span(content).background(DOT).color(DOT_TEXT),
+        Style::Bar => span(content).background(bar()),
     }
+}
+
+/// A thin bar on the left edge of a character, drawn as a background that is
+/// solid for the first fifth of its width and clear for the rest. This draws a
+/// bar between two characters without shifting any text.
+fn bar() -> Gradient {
+    // Stops at the same offset replace each other, so the hard edge uses two
+    // stops a hundredth apart.
+    let clear = Color {
+        a: 0.0,
+        ..INSERT_DOT
+    };
+    Gradient::Linear(
+        // A quarter turn points the gradient from left to right.
+        gradient::Linear::new(Radians(FRAC_PI_2))
+            .add_stop(0.0, INSERT_DOT)
+            .add_stop(BAR_WIDTH, INSERT_DOT)
+            .add_stop(BAR_WIDTH + 0.01, clear)
+            .add_stop(1.0, clear),
+    )
 }

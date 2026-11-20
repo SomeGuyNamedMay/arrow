@@ -1,4 +1,4 @@
-package arrow:plugin@0.4.0;
+package arrow:plugin@0.6.0;
 
 interface types {
     record selection {
@@ -28,6 +28,88 @@ interface types {
         selection-changed(selection),
         mode-changed(string),
         command-executed(string),
+    }
+
+    /// One entry in a menu.
+    record menu-item {
+        /// Shown first, and what the typed input is matched against.
+        label: string,
+        /// Passed to the menu's `on-select` command when this item is chosen.
+        value: string,
+        /// Shown highlighted in its own column, e.g. a key binding or a
+        /// completion kind ("fn", "struct"). May be empty.
+        annotation: string,
+        /// Shown dimmed after it, e.g. a description or a type signature. May
+        /// be empty.
+        detail: string,
+    }
+
+    /// A menu for the user to pick from, shown like Emacs's Vertico.
+    record menu {
+        /// Shown before the input, e.g. "M-x".
+        prompt: string,
+        /// Input to start with.
+        input: string,
+        /// In ranking order. Typing filters them (space-separated parts must all
+        /// appear in the label, in any order); the order is kept, except that an
+        /// exact match moves to the top.
+        items: list<menu-item>,
+        /// Command to run with the chosen item's `value` as its argument.
+        on-select: string,
+    }
+
+    /// A registered command, as listed by `list-commands`.
+    record command-info {
+        name: string,
+        description: string,
+        /// Name of the plugin providing it, or "app" for the host's own commands.
+        plugin: string,
+        /// Its normal-mode key binding, if it has one, e.g. "<a-s>".
+        binding: option<string>,
+        /// Whether it waits for a typed character before running.
+        takes-char: bool,
+    }
+
+    /// One node of a tree menu. WIT has no recursive types, so a tree is sent as
+    /// a flat list in which each node names its parent.
+    record tree-node {
+        /// Shown in the menu.
+        label: string,
+        /// Identifies the node: other nodes name it as their parent, and it is
+        /// passed to the menu's `on-select` or `on-expand` command.
+        value: string,
+        /// Shown in a column beside the label, e.g. a file size.
+        annotation: string,
+        /// Shown in the preview column when the node is a highlighted leaf.
+        detail: string,
+        /// `value` of the parent node, or none for a top-level node.
+        parent: option<string>,
+        /// Whether the node is a branch that has, or may have, children.
+        branch: bool,
+    }
+
+    /// A tree for the user to browse, shown like the file manager ranger: the
+    /// parent level, the current level and a preview of the highlighted node.
+    record tree-menu {
+        /// Shown in the header, before the path to the current level.
+        title: string,
+        /// Any number of levels. Branches whose children aren't listed are
+        /// filled in on demand through `on-expand`.
+        nodes: list<tree-node>,
+        /// Command to run with a leaf's `value` when it is chosen.
+        on-select: string,
+        /// Command to run with a branch's `value` the first time its children are
+        /// needed (when it is highlighted or entered). It should answer with
+        /// `add-tree-nodes`. None means every branch is already complete.
+        on-expand: option<string>,
+    }
+
+    /// A key binding, as listed by `list-bindings`.
+    record binding-info {
+        mode: string,
+        /// In Kakoune notation, e.g. "gh" or "<a-s>".
+        keys: string,
+        command: string,
     }
 }
 
@@ -67,17 +149,22 @@ interface editor {
     /// Switch to a mode created with `define-mode`.
     set-mode: func(mode: string) -> result<_, string>;
 
+    /// The name shown in the status bar, e.g. a file path. Starts as "*scratch*".
+    get-buffer-name: func() -> string;
+    set-buffer-name: func(name: string);
+
     /// Show a message in the status bar until the next key press.
     message: func(text: string);
 
-    /// Run any command by name after the current plugin call returns. Returns
-    /// false if no command has that name.
-    run-command: func(name: string) -> bool;
+    /// Run any command by name after the current plugin call returns, with an
+    /// optional argument. Returns false if no command has that name. A
+    /// `takes-char` command run without an argument waits for a typed character.
+    run-command: func(name: string, arg: option<string>) -> bool;
 }
 
 /// Adding modes, commands, key bindings and event hooks.
 interface registry {
-    use types.{event-kind};
+    use types.{event-kind, command-info, binding-info};
 
     /// Create a mode, or change its fallback. Characters typed in the mode with
     /// no binding run `fallback` with the character (e.g. self-insert); modes
@@ -99,19 +186,48 @@ interface registry {
 
     /// Have `on-event` called for every event of this kind.
     subscribe: func(event: event-kind);
+
+    /// Every command that can be run, from all plugins and the app, by name.
+    list-commands: func() -> list<command-info>;
+
+    /// Every key binding in every mode, in the order they were bound.
+    list-bindings: func() -> list<binding-info>;
+}
+
+/// The host's user interface.
+interface ui {
+    use types.{menu, tree-menu, tree-node};
+
+    /// Show a menu once the current plugin call returns, replacing any open menu
+    /// or tree menu. Choosing an item runs the menu's `on-select` command with
+    /// its value; Escape closes it without running anything.
+    open-menu: func(menu: menu);
+
+    /// Show a tree menu once the current plugin call returns, replacing any open
+    /// menu or tree menu. Choosing a leaf runs its `on-select` command with the
+    /// leaf's value; Escape closes it.
+    open-tree-menu: func(menu: tree-menu);
+
+    /// Add children to the open tree menu, usually in answer to `on-expand`.
+    /// `parent` is the branch being filled in (none for the top level); it is
+    /// marked complete even if `nodes` is empty. Nodes already present are kept.
+    add-tree-nodes: func(parent: option<string>, nodes: list<tree-node>);
 }
 
 world plugin {
     import editor;
     import registry;
+    import ui;
     use types.{event};
 
     /// Called once when the plugin loads. Register modes, commands, keys and
     /// hooks here.
     export init: func();
 
-    /// Run one of the commands this plugin registered.
-    export run-command: func(name: string, arg: option<char>);
+    /// Run one of the commands this plugin registered. `arg` is the typed
+    /// character for `takes-char` commands, the chosen item's value for a menu's
+    /// `on-select` command, or what another plugin passed to `run-command`.
+    export run-command: func(name: string, arg: option<string>);
 
     /// Called for each event the plugin subscribed to. Edits made here don't
     /// trigger further events.

@@ -1,12 +1,16 @@
 mod components;
 mod plugins;
 
-use components::command_menu::{self, Candidate, CommandMenu};
+use std::collections::VecDeque;
+
 use components::keys::{self, KeyChord, KeyPress};
+use components::menu::{self, Menu};
+use components::tree_menu::{self, TreeMenu};
 use components::text_editor::{Selection, TextEditor};
 use iced::widget::column;
 use iced::{Element, Subscription, Task, Theme, keyboard};
 use plugins::{Core, Event, EventKind, Lookup, PluginHost};
+use ropey::Rope;
 
 const WELCOME: &str = "\
 Welcome to Arrow, a Kakoune-style editor.
@@ -23,16 +27,14 @@ i or a enters insert mode, and Esc returns to normal mode.
 Press : or Alt-x for the command menu. Type to filter, arrows or Ctrl-n/p to
 choose, Tab to complete, Enter to run, Esc to close.
 
-All of the above comes from the bundled core plugin. The text-tools plugin adds
+All of the above, the command menu included, comes from the bundled core plugin.
+The menu itself is generic: any plugin can open one. The text-tools plugin adds
 :sort-lines (Alt-s), :duplicate-line (<space>d), :count-words (<space>c) and
 :plugin-stats.
 ";
 
-/// Commands provided by the app itself, because they control its UI.
-const APP_COMMANDS: &[(&str, &str)] = &[
-    ("command-menu", "Open the command menu"),
-    ("quit", "Close Arrow"),
-];
+/// Commands provided by the app itself, because they control the window.
+const APP_COMMANDS: &[(&str, &str)] = &[("quit", "Close Arrow")];
 
 /// Most events and queued commands handled after one action, so plugins that keep
 /// triggering each other can't hang the editor.
@@ -48,84 +50,249 @@ fn main() -> iced::Result {
         .run()
 }
 
+// ----- The window: hands key presses to the session, asynchronously -----
+
+/// The iced application. Editing runs asynchronously: each batch of key presses
+/// is handled by a [`Task`] that owns the [`Session`] while plugins run, and
+/// hands it back when they're done. Meanwhile the window keeps drawing the last
+/// [`Frame`] and queues further keys, so a slow plugin never blocks the UI and
+/// keys are still handled in the order they were pressed.
 struct App {
+    /// The editor and its plugins. `None` while a task has them.
+    session: Option<Box<Session>>,
+    /// What the session looked like when it left, drawn until it returns.
+    frame: Frame,
+    /// Keys pressed while the session was busy.
+    inbox: VecDeque<KeyPress>,
+}
+
+enum Message {
+    Key(KeyPress),
+    /// A task finished with the session.
+    Done(Box<Session>),
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::Key(press) => f.debug_tuple("Key").field(press).finish(),
+            Message::Done(_) => f.write_str("Done"),
+        }
+    }
+}
+
+/// A copy of everything the view draws. Cheap to take, because the text is a
+/// rope whose clones share their storage.
+struct Frame {
+    editor: TextEditor,
+    menu: Menu,
+    tree: TreeMenu,
+}
+
+impl App {
+    /// Start with the welcome text on screen while plugins load in the background.
+    fn new() -> (Self, Task<Message>) {
+        let app = Self {
+            session: None,
+            frame: Frame {
+                editor: TextEditor::new(WELCOME),
+                menu: Menu::new(),
+                tree: TreeMenu::new(),
+            },
+            inbox: VecDeque::new(),
+        };
+        let start = Task::perform(Session::start(WELCOME, true), |session| {
+            Message::Done(Box::new(session))
+        });
+        (app, start)
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Key(press) => self.inbox.push_back(press),
+            Message::Done(session) => {
+                if session.quit {
+                    return iced::exit();
+                }
+                self.session = Some(session);
+            }
+        }
+        self.dispatch()
+    }
+
+    /// If the session is free and keys are waiting, send them all to it.
+    fn dispatch(&mut self) -> Task<Message> {
+        if self.inbox.is_empty() {
+            return Task::none();
+        }
+        let Some(mut session) = self.session.take() else {
+            // Busy: the keys go with the next batch.
+            return Task::none();
+        };
+        self.frame = session.frame();
+        let presses: Vec<KeyPress> = self.inbox.drain(..).collect();
+        Task::perform(
+            async move {
+                for press in presses {
+                    session.press(press).await;
+                    if session.quit {
+                        break;
+                    }
+                }
+                session
+            },
+            Message::Done,
+        )
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        match &self.session {
+            Some(session) => view(&session.core.editor, &session.menu, &session.tree),
+            None => view(&self.frame.editor, &self.frame.menu, &self.frame.tree),
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        keyboard::listen().filter_map(key_message)
+    }
+}
+
+fn view<'a>(editor: &'a TextEditor, menu: &'a Menu, tree: &'a TreeMenu) -> Element<'a, Message> {
+    if menu.is_open() {
+        column![editor.view(), menu.view()].into()
+    } else if tree.is_open() {
+        column![editor.view(), tree.view()].into()
+    } else {
+        editor.view()
+    }
+}
+
+fn key_message(event: keyboard::Event) -> Option<Message> {
+    keys::from_event(event).map(Message::Key)
+}
+
+// ----- The session: the editor, its plugins and its menus -----
+
+struct Session {
     core: Core,
     plugins: PluginHost,
-    menu: CommandMenu,
+    /// The menu plugins open (the command menu, and anything else that picks
+    /// from a list).
+    menu: Menu,
+    /// The tree menu plugins open (like the file manager). It takes the same
+    /// space as `menu`; only one of the two is open at a time.
+    tree: TreeMenu,
     /// Keys typed so far in an unfinished key sequence.
     pending_keys: Vec<KeyPress>,
     /// A command waiting for a typed character (like `r`).
     awaiting_char: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-enum Message {
-    Key(KeyPress),
+    /// The `quit` command ran: close the window.
+    quit: bool,
 }
 
 /// Editor state before an action, to work out which events it caused.
 struct Observed {
-    /// Only captured when a plugin listens for buffer changes.
-    text: Option<Vec<char>>,
+    /// Only captured when a plugin listens for buffer changes. Taking it is
+    /// cheap (a rope clone); comparing it afterwards is the costly part.
+    text: Option<Rope>,
     dots: Vec<Selection>,
     mode: String,
 }
 
-impl App {
-    fn new() -> Self {
-        Self::with_plugins(WELCOME, true)
-    }
-
-    /// An app with the bundled plugins, and the user's plugins if asked.
-    fn with_plugins(text: &str, user_plugins: bool) -> Self {
+impl Session {
+    /// A session with the bundled plugins, and the user's plugins if asked.
+    async fn start(text: &str, user_plugins: bool) -> Self {
         let mut core = Core {
             editor: TextEditor::new(text),
-            app_commands: APP_COMMANDS.iter().map(|(name, _)| *name).collect(),
+            app_commands: APP_COMMANDS.to_vec(),
             ..Default::default()
         };
         let mut plugins = PluginHost::new();
-        let mut errors = plugins.load_bundled(&mut core);
+        let mut errors = plugins.load_bundled(&mut core).await;
         if user_plugins {
-            errors.extend(plugins.load_user_plugins(&mut core));
+            errors.extend(plugins.load_user_plugins(&mut core).await);
         }
 
-        let mut app = Self {
+        let mut session = Self {
             core,
             plugins,
-            menu: CommandMenu::new(),
+            menu: Menu::new(),
+            tree: TreeMenu::new(),
             pending_keys: Vec::new(),
             awaiting_char: None,
+            quit: false,
         };
-        app.core.events.push_back(Event::Startup);
-        let _ = app.follow_up();
+        session.core.events.push_back(Event::Startup);
+        session.follow_up().await;
+        session.sync_menus().await;
         for error in errors {
-            app.report(error);
+            session.report(error);
         }
-        app
+        session
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
-        let Message::Key(press) = message;
-        self.perform(|app| app.handle_key(press))
+    fn frame(&self) -> Frame {
+        Frame {
+            editor: self.core.editor.clone(),
+            menu: self.menu.clone(),
+            tree: self.tree.clone(),
+        }
     }
 
-    /// Run an action, then deliver the events it caused and any commands plugins
-    /// queued along the way.
-    fn perform(&mut self, action: impl FnOnce(&mut Self) -> Task<Message>) -> Task<Message> {
+    /// Handle a key press, then deliver the events it caused and any commands
+    /// plugins queued along the way.
+    async fn press(&mut self, press: KeyPress) {
         let before = self.observe();
-        let task = action(self);
+        self.handle_key(press).await;
         self.emit_changes(before);
-        Task::batch([task, self.follow_up()])
+        self.follow_up().await;
+        self.sync_menus().await;
+    }
+
+    /// Bring the menus up to date with what plugins asked for: open a requested
+    /// menu or tree menu, add tree nodes, and ask plugins for the children of
+    /// tree branches the tree menu needs, repeating until nothing is pending.
+    async fn sync_menus(&mut self) {
+        for _ in 0..MAX_FOLLOW_UPS {
+            if let Some(spec) = self.core.menu_request.take() {
+                self.tree.close();
+                self.menu.open(spec);
+            }
+            if let Some(spec) = self.core.tree_request.take() {
+                self.menu = Menu::new();
+                self.tree.open(spec);
+            }
+            for (parent, nodes) in std::mem::take(&mut self.core.tree_additions) {
+                self.tree.add_nodes(parent, nodes);
+            }
+            let Some((command, value)) = self.tree.take_expand_request() else {
+                break;
+            };
+            let before = self.observe();
+            self.run_command(&command, Some(value)).await;
+            self.emit_changes(before);
+            self.follow_up().await;
+        }
     }
 
     /// Turn a key press into a command using the keymaps plugins registered.
-    fn handle_key(&mut self, press: KeyPress) -> Task<Message> {
-        // While the menu is open it gets every key.
+    async fn handle_key(&mut self, press: KeyPress) {
+        // While the tree menu is open it gets every key. Choosing a leaf runs the
+        // command the plugin named, with the leaf's value.
+        if self.tree.is_open() {
+            if let Some(tree_menu::Event::Selected { command, value }) = self.tree.handle_key(press) {
+                self.run_command(&command, Some(value)).await;
+            }
+            return;
+        }
+
+        // While a menu is open it gets every key. Choosing an item runs the
+        // command the plugin named, with the item's value.
         if self.menu.is_open() {
-            return match self.menu.handle_key(press) {
-                Some(command_menu::Event::Execute(name)) => self.run_command(&name, None),
-                _ => Task::none(),
-            };
+            if let Some(menu::Event::Selected { command, value }) = self.menu.handle_key(press) {
+                self.run_command(&command, Some(value)).await;
+            }
+            return;
         }
 
         // Messages and hints last until the next key.
@@ -133,10 +300,10 @@ impl App {
 
         if let Some(command) = self.awaiting_char.take() {
             // Any key that doesn't type a character cancels.
-            return match press.typed_char() {
-                Some(c) => self.run_command(&command, Some(c)),
-                None => Task::none(),
-            };
+            if let Some(c) = press.typed_char() {
+                self.run_command(&command, Some(c.to_string())).await;
+            }
+            return;
         }
 
         self.pending_keys.push(press);
@@ -146,60 +313,55 @@ impl App {
         match registry.lookup(&mode, &chords) {
             Lookup::Command(command) => {
                 self.pending_keys.clear();
-                self.run_command(&command, None)
+                self.run_command(&command, None).await;
             }
             Lookup::Prefix => {
                 let hint = registry.prefix_hint(&mode, &chords);
                 self.core.editor.editor_mut().set_message(hint);
-                Task::none()
             }
             Lookup::Unbound => {
                 let in_sequence = self.pending_keys.len() > 1;
                 self.pending_keys.clear();
-                match (press.typed_char(), registry.fallback(&mode)) {
+                let fallback = registry.fallback(&mode).map(str::to_string);
+                match (press.typed_char(), fallback) {
                     // An unknown key after a prefix just cancels the sequence.
-                    _ if in_sequence => Task::none(),
+                    _ if in_sequence => {}
                     // Typing modes send unbound characters to their fallback.
                     (Some(c), Some(fallback)) => {
-                        let fallback = fallback.to_string();
-                        self.run_command(&fallback, Some(c))
+                        self.run_command(&fallback, Some(c.to_string())).await;
                     }
-                    _ => Task::none(),
+                    _ => {}
                 }
             }
         }
     }
 
     /// Run a command by name: an app command or a plugin command.
-    fn run_command(&mut self, name: &str, arg: Option<char>) -> Task<Message> {
-        let task = match name {
-            "quit" => iced::exit(),
-            "command-menu" => {
-                self.menu.open(self.candidates());
-                Task::none()
-            }
+    async fn run_command(&mut self, name: &str, arg: Option<String>) {
+        match name {
+            "quit" => self.quit = true,
             _ => {
                 let Some(command) = self.core.registry.command(name) else {
                     self.report(format!("no such command: {name}"));
-                    return Task::none();
+                    return;
                 };
                 if command.takes_char && arg.is_none() {
                     self.awaiting_char = Some(name.to_string());
                     let hint = format!("{name}: type a character");
                     self.core.editor.editor_mut().set_message(hint);
-                    return Task::none();
+                    return;
                 }
                 let plugin = command.plugin;
-                if let Err(error) = self.plugins.run_command(plugin, &mut self.core, name, arg) {
+                let arg = arg.as_deref();
+                let result = self.plugins.run_command(plugin, &mut self.core, name, arg).await;
+                if let Err(error) = result {
                     self.report(error);
                 }
-                Task::none()
             }
-        };
+        }
         self.core
             .events
             .push_back(Event::CommandExecuted(name.to_string()));
-        task
     }
 
     fn observe(&self) -> Observed {
@@ -209,7 +371,7 @@ impl App {
                 .core
                 .registry
                 .has_subscribers(EventKind::BufferChanged)
-                .then(|| editor.chars().to_vec()),
+                .then(|| editor.rope().clone()),
             dots: editor.dots().to_vec(),
             mode: editor.mode().to_string(),
         }
@@ -218,7 +380,7 @@ impl App {
     fn emit_changes(&mut self, before: Observed) {
         let editor = self.core.editor.editor();
         let events = &mut self.core.events;
-        if before.text.is_some_and(|text| text != editor.chars()) {
+        if before.text.is_some_and(|text| text != *editor.rope()) {
             events.push_back(Event::BufferChanged);
         }
         if editor.dots() != before.dots {
@@ -231,17 +393,16 @@ impl App {
 
     /// Deliver queued events and run queued commands until both queues are empty.
     /// Edits made by event hooks don't cause further events; queued commands do.
-    fn follow_up(&mut self) -> Task<Message> {
-        let mut tasks = Vec::new();
+    async fn follow_up(&mut self) {
         for _ in 0..MAX_FOLLOW_UPS {
             if let Some(event) = self.core.events.pop_front() {
-                self.dispatch(&event);
-            } else if let Some(name) = self.core.queued_commands.pop_front() {
+                self.dispatch(&event).await;
+            } else if let Some((name, arg)) = self.core.queued_commands.pop_front() {
                 let before = self.observe();
-                tasks.push(self.run_command(&name, None));
+                self.run_command(&name, arg).await;
                 self.emit_changes(before);
             } else {
-                return Task::batch(tasks);
+                return;
             }
         }
         self.core.events.clear();
@@ -249,10 +410,9 @@ impl App {
         self.report(format!(
             "stopped after {MAX_FOLLOW_UPS} plugin events and commands; a plugin may be looping"
         ));
-        Task::batch(tasks)
     }
 
-    fn dispatch(&mut self, event: &Event) {
+    async fn dispatch(&mut self, event: &Event) {
         let kind = match event {
             Event::Startup => EventKind::Startup,
             Event::BufferChanged => EventKind::BufferChanged,
@@ -261,7 +421,7 @@ impl App {
             Event::CommandExecuted(_) => EventKind::CommandExecuted,
         };
         for plugin in self.core.registry.subscribers(kind) {
-            if let Err(error) = self.plugins.send_event(plugin, &mut self.core, event) {
+            if let Err(error) = self.plugins.send_event(plugin, &mut self.core, event).await {
                 self.report(error);
             }
         }
@@ -271,55 +431,28 @@ impl App {
         eprintln!("{error}");
         self.core.editor.editor_mut().set_message(error);
     }
-
-    /// Everything the command menu can run, with key bindings where known.
-    fn candidates(&self) -> Vec<Candidate> {
-        let registry = &self.core.registry;
-        let plugin_commands = registry.commands().into_iter().map(|(name, command)| {
-            // Name the plugin, except for the core one that provides the basics.
-            let plugin = self.plugins.name(command.plugin);
-            let description = if plugin == "core" {
-                command.description.clone()
-            } else {
-                format!("{} ({plugin})", command.description)
-            };
-            Candidate {
-                name: name.to_string(),
-                description,
-                binding: registry.binding_for(name).unwrap_or_default(),
-            }
-        });
-        let app = APP_COMMANDS.iter().map(|(name, description)| Candidate {
-            name: name.to_string(),
-            description: description.to_string(),
-            binding: registry.binding_for(name).unwrap_or_default(),
-        });
-        plugin_commands.chain(app).collect()
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        if self.menu.is_open() {
-            column![self.core.editor.view(), self.menu.view()].into()
-        } else {
-            self.core.editor.view()
-        }
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        keyboard::listen().filter_map(key_message)
-    }
-}
-
-fn key_message(event: keyboard::Event) -> Option<Message> {
-    keys::from_event(event).map(Message::Key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The tests play the window's part: they drive the session's futures to
+    /// completion, one key at a time.
+    type App = Session;
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        thread_local! {
+            static RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a tokio runtime for the tests");
+        }
+        RUNTIME.with(|runtime| runtime.block_on(future))
+    }
+
     fn app(text: &str) -> App {
-        let app = App::with_plugins(text, false);
+        let app = block_on(Session::start(text, false));
         assert!(
             message(&app).starts_with("text-tools loaded"),
             "plugins should load cleanly: {}",
@@ -331,7 +464,7 @@ mod tests {
     /// Type keys written in Kakoune notation, e.g. "wd", "itext<esc>".
     fn type_keys(app: &mut App, keys: &str) {
         for chord in keys::parse_keys(keys).unwrap() {
-            let _ = app.update(Message::Key(KeyPress {
+            block_on(app.press(KeyPress {
                 key: chord.key,
                 alt: chord.alt,
                 ctrl: chord.ctrl,
@@ -360,17 +493,105 @@ mod tests {
         app.core.editor.editor().cursor_position()
     }
 
+    /// The items in the open menu, in display order.
+    fn menu_items(app: &App) -> Vec<menu::MenuItem> {
+        app.menu.matching_items().into_iter().cloned().collect()
+    }
+
+    fn menu_item(app: &App, label: &str) -> menu::MenuItem {
+        menu_items(app)
+            .into_iter()
+            .find(|item| item.label == label)
+            .unwrap_or_else(|| panic!("no menu item `{label}`"))
+    }
+
+    fn press(key: char) -> Message {
+        let chord = keys::parse_keys(&key.to_string()).unwrap()[0];
+        Message::Key(KeyPress {
+            key: chord.key,
+            alt: chord.alt,
+            ctrl: chord.ctrl,
+            shift: chord.shift,
+        })
+    }
+
+    #[test]
+    fn keys_pressed_while_the_session_is_busy_wait_their_turn() {
+        let session = app("abc");
+        let mut window = super::App {
+            frame: session.frame(),
+            session: Some(Box::new(session)),
+            inbox: VecDeque::new(),
+        };
+        // The first key sends the session off in a task; the view falls back to
+        // the frame it left behind.
+        let _ = window.update(press('i'));
+        assert!(window.session.is_none());
+        assert_eq!(window.frame.editor.editor().slice(0, 3), "abc");
+        // Keys arriving meanwhile are kept, in order, for its return.
+        let _ = window.update(press('x'));
+        let _ = window.update(press('y'));
+        assert_eq!(window.inbox.len(), 2);
+    }
+
     // ----- Core plugin: editing behaviour -----
 
     #[test]
     fn core_plugin_provides_modes_commands_and_bindings() {
-        let app = app("");
+        let mut app = app("");
         assert_eq!(app.core.editor.editor().mode(), "normal");
         assert!(app.core.registry.fallback("insert").is_some());
-        let candidates = app.candidates();
-        assert!(candidates.len() > 60, "{} commands", candidates.len());
-        let menu = candidates.iter().find(|c| c.name == "command-menu").unwrap();
-        assert_eq!(menu.binding, ":");
+        // The command menu comes from core too, through the generic menu.
+        type_keys(&mut app, ":");
+        assert!(app.menu.is_open());
+        let items = menu_items(&app);
+        assert!(items.len() > 60, "{} commands", items.len());
+        assert_eq!(menu_item(&app, "command-menu").annotation, ":");
+        assert_eq!(menu_item(&app, "quit").detail, "Close Arrow (app)");
+        type_keys(&mut app, "<esc>");
+        assert!(!app.menu.is_open());
+    }
+
+    #[test]
+    fn describe_bindings_lists_and_explains_every_binding() {
+        let mut app = app("abc");
+        type_keys(&mut app, "?");
+        assert!(app.menu.is_open());
+        let items = menu_items(&app);
+        // Normal-mode bindings come first, then insert mode.
+        assert_eq!(items[0].annotation, "normal");
+        assert_eq!(items.last().unwrap().annotation, "insert");
+        // Bindings from other plugins are listed and named.
+        let duplicate = items
+            .iter()
+            .find(|item| item.label.ends_with("duplicate-line"))
+            .unwrap();
+        assert!(duplicate.label.starts_with("<space>d"), "{}", duplicate.label);
+        assert!(duplicate.detail.ends_with("(text-tools)"), "{}", duplicate.detail);
+
+        // Search by keys and command name (goto-line-start is also on <home>);
+        // choosing explains the binding without running it.
+        type_keys(&mut app, "gh<space>goto<ret>");
+        assert!(!app.menu.is_open());
+        assert_eq!(
+            message(&app),
+            "gh in normal mode runs goto-line-start: Go to the start of the line"
+        );
+        assert_eq!(text(&app), "abc\n");
+    }
+
+    #[test]
+    fn command_menu_lists_recent_commands_first() {
+        let mut app = app("abc");
+        type_keys(&mut app, ":select-line<ret>");
+        assert_eq!(selected(&app), "abc\n");
+        type_keys(&mut app, ":");
+        assert_eq!(menu_items(&app)[0].label, "select-line");
+        // A takes-char command chosen from the menu still waits for its character.
+        type_keys(&mut app, "<c-backspace>replace-chars<ret>");
+        assert_eq!(message(&app), "replace-chars: type a character");
+        type_keys(&mut app, "z");
+        assert_eq!(text(&app), "zzz\n");
     }
 
     #[test]
@@ -571,10 +792,10 @@ mod tests {
         // Bound by text-tools to a command from core.
         type_keys(&mut app, "<space>a");
         assert_eq!(selected(&app), text(&app));
-        let candidates = app.candidates();
-        let sort = candidates.iter().find(|c| c.name == "sort-lines").unwrap();
-        assert_eq!(sort.binding, "<a-s>");
-        assert!(sort.description.ends_with("(text-tools)"));
+        type_keys(&mut app, ":");
+        let sort = menu_item(&app, "sort-lines");
+        assert_eq!(sort.annotation, "<a-s>");
+        assert!(sort.detail.ends_with("(text-tools)"), "{}", sort.detail);
     }
 
     #[test]
@@ -590,14 +811,65 @@ mod tests {
         assert_eq!(text(&app), "ab\ncd\nef\n");
     }
 
+    // ----- files plugin: the tree menu -----
+
+    /// Move the file manager's highlight down to the node with this value.
+    fn highlight(app: &mut App, value: &str) {
+        for _ in 0..50 {
+            if app.tree.highlighted_value() == Some(value) {
+                return;
+            }
+            type_keys(app, "j");
+        }
+        panic!("`{value}` not found in the file manager");
+    }
+
+    #[test]
+    fn file_manager_browses_and_opens_files() {
+        let mut app = app("scratch");
+        type_keys(&mut app, "<space>f");
+        assert!(app.tree.is_open());
+        // Directories come first, sorted by name; hidden ones like .git are left out.
+        assert_eq!(app.tree.highlighted_value(), Some("plugins"));
+
+        highlight(&mut app, "src");
+        type_keys(&mut app, "l");
+        highlight(&mut app, "src/main.rs");
+        // h goes back up and l returns to the same place.
+        type_keys(&mut app, "hl");
+        assert_eq!(app.tree.highlighted_value(), Some("src/main.rs"));
+
+        type_keys(&mut app, "<ret>");
+        assert!(!app.tree.is_open());
+        assert!(text(&app).starts_with("mod components;"), "{}", &text(&app)[..40]);
+        assert_eq!(app.core.editor.editor().name(), "src/main.rs");
+        assert_eq!(message(&app), "opened src/main.rs");
+
+        // Loading a file is an undoable change like any other.
+        type_keys(&mut app, "u");
+        assert_eq!(text(&app), "scratch\n");
+    }
+
+    #[test]
+    fn file_manager_closes_with_escape_and_only_it_can_read_files() {
+        let mut app = app("");
+        type_keys(&mut app, "<space>f<esc>");
+        assert!(!app.tree.is_open());
+        // Plugins without file access can't open files: the command belongs to
+        // the files plugin, which runs it in its own sandbox.
+        type_keys(&mut app, ":open-file<ret>");
+        assert!(message(&app).contains("needs a path"), "{}", message(&app));
+    }
+
     #[test]
     fn event_hooks_see_commands_and_changes() {
         let mut app = app("one");
         type_keys(&mut app, "<space>d:plugin-stats<ret>");
         let stats = message(&app);
-        // command-menu also counts as a command.
+        // Opening the menu (command-menu) and choosing from it (execute-command,
+        // which then runs plugin-stats) are commands too.
         assert!(
-            stats.starts_with("seen: 2 commands (last: command-menu), 1 buffer changes"),
+            stats.starts_with("seen: 3 commands (last: execute-command), 1 buffer changes"),
             "{stats}"
         );
     }

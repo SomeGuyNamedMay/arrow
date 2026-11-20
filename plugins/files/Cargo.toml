@@ -1,0 +1,12 @@
+[package]
+name = "files"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A ranger-inspired file manager for Arrow, built on the tree menu."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.63.0"

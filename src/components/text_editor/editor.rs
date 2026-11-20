@@ -7,6 +7,11 @@
 //!
 //! Its one rule is safety for drawing: dot positions are kept inside the text,
 //! and there is always at least one dot.
+//!
+//! The text is a [`Rope`], so edits and line lookups take logarithmic time
+//! however large the buffer is. Positions are character indices.
+
+use ropey::Rope;
 
 /// Mode the editor starts in. Plugins define what it does.
 pub const INITIAL_MODE: &str = "normal";
@@ -44,25 +49,38 @@ impl Selection {
     }
 }
 
+/// Cheap to clone: the text is a rope, which shares its chunks between clones.
+#[derive(Clone)]
 pub struct Editor {
-    text: Vec<char>,
+    text: Rope,
     /// Never empty. The last one is the primary dot.
     dots: Vec<Selection>,
     mode: String,
     /// Whether the current mode types characters (it has a fallback command).
     inserting: bool,
     message: Option<String>,
+    /// Shown in the status bar, e.g. a file path.
+    name: String,
 }
 
 impl Editor {
     pub fn new(text: &str) -> Self {
         Self {
-            text: text.chars().collect(),
+            text: Rope::from_str(text),
             dots: vec![Selection::point(0)],
             mode: INITIAL_MODE.to_string(),
             inserting: false,
             message: None,
+            name: "*scratch*".to_string(),
         }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
     }
 
     // ----- Reading -----
@@ -92,53 +110,62 @@ impl Editor {
         self.message.as_deref()
     }
 
-    pub fn chars(&self) -> &[char] {
+    /// The whole text. Cloning it is cheap.
+    pub fn rope(&self) -> &Rope {
         &self.text
     }
 
     pub fn len(&self) -> usize {
-        self.text.len()
+        self.text.len_chars()
     }
 
     pub fn char_at(&self, index: usize) -> Option<char> {
-        self.text.get(index).copied()
+        (index < self.len()).then(|| self.text.char(index))
     }
 
     /// Text in `start..end` (end exclusive), clamped to the text.
     pub fn slice(&self, start: usize, end: usize) -> String {
-        let end = end.min(self.text.len());
+        let end = end.min(self.len());
         let start = start.min(end);
-        self.text[start..end].iter().collect()
+        self.text.slice(start..end).to_string()
     }
 
-    /// Index of the first character of every line. A newline at the very end
-    /// doesn't start another line.
-    pub fn line_starts(&self) -> Vec<usize> {
-        let body = &self.text[..self.text.len().saturating_sub(1)];
-        std::iter::once(0)
-            .chain(
-                body.iter()
-                    .enumerate()
-                    .filter(|(_, c)| **c == '\n')
-                    .map(|(i, _)| i + 1),
-            )
-            .collect()
+    /// Number of lines. A newline at the very end doesn't start another line.
+    pub fn line_count(&self) -> usize {
+        let lines = self.text.len_lines();
+        if lines > 1 && self.char_at(self.len() - 1) == Some('\n') {
+            lines - 1
+        } else {
+            lines
+        }
+    }
+
+    /// Index of the first character of line `line` (0-based, below `line_count`).
+    pub fn line_start(&self, line: usize) -> usize {
+        self.text.line_to_char(line)
+    }
+
+    /// Index of the newline ending line `line`, or the text's length if the line
+    /// doesn't end with one.
+    pub fn line_end(&self, line: usize) -> usize {
+        let text = self.text.line(line);
+        let chars = text.len_chars();
+        let newline = chars > 0 && text.char(chars - 1) == '\n';
+        self.line_start(line) + chars - usize::from(newline)
     }
 
     /// 0-based line and column of the primary dot's cursor.
     pub fn cursor_position(&self) -> (usize, usize) {
-        let cursor = self.selection().cursor.min(self.text.len());
-        let before = &self.text[..cursor];
-        let line = before.iter().filter(|c| **c == '\n').count();
-        let line_start = before.iter().rposition(|c| *c == '\n').map_or(0, |i| i + 1);
-        (line, cursor - line_start)
+        let cursor = self.selection().cursor.min(self.len());
+        let line = self.text.char_to_line(cursor).min(self.line_count() - 1);
+        (line, cursor - self.line_start(line))
     }
 
     // ----- Writing (used by plugins through the host) -----
 
     /// Pull a dot back inside the text.
     fn clamp(&self, selection: Selection) -> Selection {
-        let last = self.text.len().saturating_sub(1);
+        let last = self.len().saturating_sub(1);
         Selection {
             anchor: selection.anchor.min(last),
             cursor: selection.cursor.min(last),
@@ -148,9 +175,10 @@ impl Editor {
     /// Replace `start..end` (end exclusive) with `text`. Dots are not moved, only
     /// pulled back inside the text if it got shorter.
     pub fn replace(&mut self, start: usize, end: usize, text: &str) {
-        let end = end.min(self.text.len());
+        let end = end.min(self.len());
         let start = start.min(end);
-        self.text.splice(start..end, text.chars());
+        self.text.remove(start..end);
+        self.text.insert(start, text);
         self.dots = self.dots.iter().map(|dot| self.clamp(*dot)).collect();
     }
 
@@ -218,15 +246,34 @@ mod tests {
         assert_eq!(editor.dots().len(), 1, "there is always a dot");
     }
 
+    fn lines(editor: &Editor) -> Vec<(usize, usize)> {
+        (0..editor.line_count())
+            .map(|line| (editor.line_start(line), editor.line_end(line)))
+            .collect()
+    }
+
     #[test]
     fn positions() {
         let mut editor = Editor::new("ab\n\ncd\n");
-        assert_eq!(editor.line_starts(), vec![0, 3, 4]);
+        assert_eq!(lines(&editor), [(0, 2), (3, 3), (4, 6)]);
         editor.set_selection(Selection::point(5));
         assert_eq!(editor.cursor_position(), (2, 1));
         // Text without a final newline, and empty text, still work.
-        assert_eq!(Editor::new("ab\ncd").line_starts(), vec![0, 3]);
-        assert_eq!(Editor::new("").line_starts(), vec![0]);
+        assert_eq!(lines(&Editor::new("ab\ncd")), [(0, 2), (3, 5)]);
+        assert_eq!(lines(&Editor::new("")), [(0, 0)]);
         assert_eq!(Editor::new("").cursor_position(), (0, 0));
+        // Only "\n" ends a line.
+        assert_eq!(Editor::new("a\rb\r\nc").line_count(), 2);
+    }
+
+    #[test]
+    fn replace_works_across_rope_chunks() {
+        let long = "line of text\n".repeat(5000);
+        let mut editor = Editor::new(&long);
+        editor.replace(13 * 2500, 13 * 2501, "");
+        editor.replace(5, 5, "é");
+        assert_eq!(editor.len(), long.chars().count() - 13 + 1);
+        assert_eq!(editor.line_count(), 4999);
+        assert_eq!(editor.slice(0, 8), "line éof");
     }
 }
