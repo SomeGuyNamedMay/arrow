@@ -16,6 +16,8 @@ use iced::{Center, Color, Element, Fill, Font, Radians, Size};
 
 pub use editor::{Editor, Selection};
 
+use crate::syntax::Highlighter;
+
 const FONT_SIZE: f32 = 15.0;
 /// Fixed line height, so the number of visible lines is easy to work out.
 const LINE_HEIGHT: f32 = 20.0;
@@ -42,6 +44,9 @@ pub struct TextEditor {
     editor: Editor,
     /// First visible line. Adjusted while drawing to keep the cursor in view.
     top_line: Cell<usize>,
+    /// Colours the text, if the buffer has a language. Kept in step with the
+    /// text by the session's syntax tree.
+    highlighter: Option<Highlighter>,
 }
 
 /// How a run of characters is drawn.
@@ -66,7 +71,17 @@ impl TextEditor {
         Self {
             editor: Editor::new(text),
             top_line: Cell::new(0),
+            highlighter: None,
         }
+    }
+
+    pub fn set_highlighter(&mut self, highlighter: Option<Highlighter>) {
+        self.highlighter = highlighter;
+    }
+
+    #[cfg(test)]
+    pub fn highlighter(&self) -> Option<&Highlighter> {
+        self.highlighter.as_ref()
     }
 
     pub fn editor(&self) -> &Editor {
@@ -106,7 +121,15 @@ impl TextEditor {
         self.top_line.set(top);
 
         let gutter_width = line_count.to_string().len();
-        let lines = (top..line_count.min(top + rows)).map(|n| {
+        let bottom = line_count.min(top + rows);
+        // Colours for the visible lines only, newlines included.
+        let first = self.editor.line_start(top);
+        let shown = first..(self.editor.line_end(bottom - 1) + 1).min(self.editor.len());
+        let colors = match &self.highlighter {
+            Some(highlighter) => highlighter.colors(self.editor.rope(), shown),
+            None => Vec::new(),
+        };
+        let lines = (top..bottom).map(|n| {
             // The line's newline, or one past the end if the text doesn't end with one.
             let (start, end) = (self.editor.line_start(n), self.editor.line_end(n));
             let number = text(format!("{:>gutter_width$} ", n + 1))
@@ -114,7 +137,8 @@ impl TextEditor {
                 .size(FONT_SIZE)
                 .line_height(line_height())
                 .color(if n == cursor_line { TEXT } else { GUTTER });
-            let content = rich_text(self.line_spans(start, end))
+            let color = |i: usize| colors.get(i - first).copied().flatten();
+            let content = rich_text(self.line_spans(start, end, color))
                 .font(Font::MONOSPACE)
                 .size(FONT_SIZE)
                 .line_height(line_height())
@@ -126,8 +150,14 @@ impl TextEditor {
     }
 
     /// Spans for one line (`start..=end`, where `end` is its newline), with every
-    /// character a dot covers drawn the same way.
-    fn line_spans(&self, start: usize, end: usize) -> Vec<Span<'static, (), Font>> {
+    /// character a dot covers drawn the same way, and the rest in its syntax
+    /// colour (`color`, by character index).
+    fn line_spans(
+        &self,
+        start: usize,
+        end: usize,
+        color: impl Fn(usize) -> Option<Color>,
+    ) -> Vec<Span<'static, (), Font>> {
         // The line itself, with its newline if it has one.
         let chars: Vec<char> = self
             .editor
@@ -164,12 +194,12 @@ impl TextEditor {
 
         let mut spans = Vec::new();
         let mut run = String::new();
-        let mut run_style = style_of(start);
+        let mut run_style = (style_of(start), color(start));
         for i in start..=end {
-            let style = style_of(i);
+            let style = (style_of(i), color(i));
             // A bar is drawn across its span's left edge, so each bar character
             // gets a span of its own.
-            if (style != run_style || style == Style::Bar) && !run.is_empty() {
+            if (style != run_style || style.0 == Style::Bar) && !run.is_empty() {
                 spans.push(styled_span(std::mem::take(&mut run), run_style));
             }
             run_style = style;
@@ -230,11 +260,17 @@ fn line_height() -> LineHeight {
     LineHeight::Absolute(LINE_HEIGHT.into())
 }
 
-fn styled_span(content: String, style: Style) -> Span<'static, (), Font> {
+/// A span in a style, with its syntax colour if it has one. Text under a dot is
+/// always drawn in the dot's text colour, so it stays readable.
+fn styled_span(content: String, (style, color): (Style, Option<Color>)) -> Span<'static, (), Font> {
+    let span = match color {
+        Some(color) => span(content).color(color),
+        None => span(content),
+    };
     match style {
-        Style::Plain => span(content),
-        Style::Dot => span(content).background(DOT).color(DOT_TEXT),
-        Style::Bar => span(content).background(bar()),
+        Style::Plain => span,
+        Style::Dot => span.background(DOT).color(DOT_TEXT),
+        Style::Bar => span.background(bar()),
     }
 }
 

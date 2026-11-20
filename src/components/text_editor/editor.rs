@@ -12,6 +12,9 @@
 //! however large the buffer is. Positions are character indices.
 
 use ropey::Rope;
+use tree_sitter::InputEdit;
+
+use crate::syntax;
 
 /// Mode the editor starts in. Plugins define what it does.
 pub const INITIAL_MODE: &str = "normal";
@@ -61,6 +64,8 @@ pub struct Editor {
     message: Option<String>,
     /// Shown in the status bar, e.g. a file path.
     name: String,
+    /// Changes since the syntax tree last caught up, in the order they were made.
+    edits: Vec<InputEdit>,
 }
 
 impl Editor {
@@ -72,7 +77,13 @@ impl Editor {
             inserting: false,
             message: None,
             name: "*scratch*".to_string(),
+            edits: Vec::new(),
         }
+    }
+
+    /// The changes made since the last call, for the syntax tree.
+    pub fn take_edits(&mut self) -> Vec<InputEdit> {
+        std::mem::take(&mut self.edits)
     }
 
     pub fn name(&self) -> &str {
@@ -177,6 +188,10 @@ impl Editor {
     pub fn replace(&mut self, start: usize, end: usize, text: &str) {
         let end = end.min(self.len());
         let start = start.min(end);
+        if start == end && text.is_empty() {
+            return;
+        }
+        self.edits.push(syntax::input_edit(&self.text, start, end, text));
         self.text.remove(start..end);
         self.text.insert(start, text);
         self.dots = self.dots.iter().map(|dot| self.clamp(*dot)).collect();

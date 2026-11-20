@@ -1,0 +1,13 @@
+[[language]]
+name = "demo"
+extensions = ["demo"]
+
+# A grammar that isn't installed: the editor reports it when a file needs it.
+[[language]]
+name = "missing"
+extensions = ["missing"]
+
+[theme]
+keyword = "#ff0000"
+"variable.other" = "#00ff00"
+variable = "#0000ff"

@@ -1,0 +1,4 @@
+{
+  "grammars": [{ "name": "demo", "scope": "source.demo", "path": ".", "file-types": ["demo"] }],
+  "metadata": { "version": "0.1.0", "license": "MIT", "description": "Test grammar for Arrow" }
+}
