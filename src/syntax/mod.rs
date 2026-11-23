@@ -45,6 +45,7 @@ use tree_sitter::wasmtime::Engine;
 use tree_sitter::{InputEdit, Language, Parser, Point, Query, Tree, WasmStore};
 
 use crate::components::text_editor::TextEditor;
+use crate::plugins::BufferId;
 use config::LanguageConfig;
 pub use config::Languages;
 use highlight::HighlightQuery;
@@ -63,21 +64,29 @@ struct Loaded {
     highlights: Option<Arc<HighlightQuery>>,
 }
 
-/// The buffer's language and its latest tree.
+/// A buffer's language and its latest tree.
 struct Current {
     language: String,
     tree: Option<Tree>,
 }
 
-/// Parses the buffer with the grammar its name calls for.
+/// What is known about one buffer.
+#[derive(Default)]
+struct BufferSyntax {
+    /// The buffer name the language was chosen for.
+    name: Option<String>,
+    /// `None` if the buffer has no language.
+    current: Option<Current>,
+}
+
+/// Parses each buffer with the grammar its name calls for. Every buffer keeps
+/// its own tree, so switching buffers doesn't mean parsing from scratch.
 pub struct Syntax {
     languages: Languages,
-    /// Owns the wasm store grammars are loaded into.
+    /// Owns the wasm store grammars are loaded into; shared by all buffers.
     parser: Parser,
     loaded: HashMap<String, Loaded>,
-    current: Option<Current>,
-    /// The buffer name the language was chosen for.
-    buffer_name: Option<String>,
+    buffers: HashMap<BufferId, BufferSyntax>,
 }
 
 impl Syntax {
@@ -91,28 +100,33 @@ impl Syntax {
             languages,
             parser,
             loaded: HashMap::new(),
-            current: None,
-            buffer_name: None,
+            buffers: HashMap::new(),
         })
     }
 
-    /// Bring the tree up to date with the buffer: choose a language if the
-    /// buffer was renamed, then reparse what changed and hand the result to the
-    /// view. An error (a grammar that won't load, say) is returned once, and the
-    /// buffer is left unhighlighted.
-    pub fn update(&mut self, editor: &mut TextEditor) -> Result<(), String> {
+    /// Bring a buffer's tree up to date with its text: choose a language if
+    /// the buffer is new or was renamed, then reparse what changed and hand the
+    /// result to the view. An error (a grammar that won't load, say) is returned
+    /// once, and the buffer is left unhighlighted.
+    pub fn update(&mut self, buffer: BufferId, editor: &mut TextEditor) -> Result<(), String> {
         let edits = editor.editor_mut().take_edits();
-        let name = editor.editor().name();
-        if self.buffer_name.as_deref() != Some(name) {
-            self.buffer_name = Some(name.to_string());
-            let config = self.languages.for_buffer(name).cloned();
-            self.current = None;
+        let name = editor.editor().name().to_string();
+        let known = self.buffers.get(&buffer).and_then(|b| b.name.as_deref());
+        if known != Some(name.as_str()) {
+            let config = self.languages.for_buffer(&name).cloned();
+            self.buffers.insert(
+                buffer,
+                BufferSyntax {
+                    name: Some(name),
+                    current: None,
+                },
+            );
             editor.set_highlighter(None);
             let Some(config) = config else {
                 return Ok(());
             };
             self.load(&config)?;
-            self.current = Some(Current {
+            self.buffers.get_mut(&buffer).expect("just added").current = Some(Current {
                 language: config.name,
                 tree: None,
             });
@@ -120,7 +134,7 @@ impl Syntax {
             return Ok(());
         }
 
-        let Some(current) = &mut self.current else {
+        let Some(current) = self.buffers.get_mut(&buffer).and_then(|b| b.current.as_mut()) else {
             return Ok(());
         };
         let loaded = &self.loaded[&current.language];
@@ -144,10 +158,10 @@ impl Syntax {
         Ok(())
     }
 
-    /// The latest tree, if the buffer has a language.
+    /// A buffer's latest tree, if it has a language.
     #[cfg(test)]
-    pub fn tree(&self) -> Option<&Tree> {
-        self.current.as_ref()?.tree.as_ref()
+    pub fn tree(&self, buffer: BufferId) -> Option<&Tree> {
+        self.buffers.get(&buffer)?.current.as_ref()?.tree.as_ref()
     }
 
     /// Load a language's grammar and highlights query, once.

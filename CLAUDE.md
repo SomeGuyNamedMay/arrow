@@ -1,0 +1,141 @@
+# Arrow
+
+A Kakoune-style modal text editor in Rust (iced GUI). The host stores text and
+draws it; **all editing behaviour comes from WebAssembly component plugins**
+(wasmtime), including the built-in modes, motions, undo and key bindings.
+
+`README.md` is the user-facing guide. It covers the key bindings, the config
+folder (`languages.toml`, grammars, queries) and what plugins can do. Update it
+when you change a default binding, the config format or the plugin API.
+
+## Build and test
+
+- `cargo test` runs everything that matters: unit tests plus end-to-end
+  session tests that load the real bundled plugins and type keys.
+- `cargo build` / `cargo run` start the editor.
+- Requirements:
+  - the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`), because
+    `build.rs` builds the plugins in `plugins/` with it.
+  - `cmake` on PATH: tree-sitter's `wasm` feature (via `wasmtime-c-api`) runs
+    it to generate headers. On this machine it may only exist inside Visual
+    Studio Build Tools (`...\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`).
+- `build.rs` rebuilds plugins automatically when `wit/` or `plugins/*/src`
+  change, into `target/plugins`, and the host embeds them with `include_bytes!`.
+- `LNK4217` linker warnings on Windows come from tree-sitter's C code and are
+  harmless.
+- The code isn't rustfmt-formatted. Don't run `cargo fmt` over the whole
+  workspace as part of an unrelated change.
+
+## Layout
+
+```
+wit/arrow.wit            the plugin API (the contract between host and plugins)
+build.rs                 builds plugins/* to wasm and copies them to OUT_DIR
+src/
+  main.rs                module overview, main()
+  app.rs                 iced window: key inbox, Frame snapshot, async dispatch
+  session/mod.rs         Session: key → command → events → follow-ups → syntax
+  session/write.rs       saving a buffer to its file (the `write` app command)
+  session/tests.rs       end-to-end tests through the bundled plugins
+  config.rs              user config dir (%APPDATA%\arrow, ~/.config/arrow)
+  plugins/mod.rs         loading/calling plugins, Core (state lent to plugins)
+  plugins/host_api.rs    host implementations of the WIT interfaces
+  plugins/registry.rs    modes, commands, key bindings, subscriptions
+  plugins/buffers.rs     multiple buffers on Core (open/switch/close/list)
+  syntax/                tree-sitter: config.rs (languages.toml, theme),
+                         highlight.rs (colours for visible text), mod.rs (parsing)
+  components/            widgets: text_editor/ (Editor storage + view),
+                         menu.rs, tree_menu.rs, keys.rs (Kakoune key notation)
+plugins/
+  core/                  modes, motions, editing, dot shifting, merging, undo
+  text-tools/            sort-lines, duplicate-line, count-words, event hooks
+  files/                 ranger-style file manager, buffer list and switching
+tests/fixtures/          demo tree-sitter grammar + config used by syntax tests
+```
+
+## Design rules
+
+- **The host only stores and draws.** `Editor::replace` doesn't move dots,
+  merge them or keep the final newline. The core plugin does that (its `edit`
+  shifts every dot). The host's one rule is that dots stay inside the text and
+  there is always at least one. Behaviour belongs in a plugin, not in the host.
+- **Positions are character indices**, not bytes. A dot is a selection
+  `min(anchor, cursor)..=max(anchor, cursor)`. The last dot is the primary one.
+  Tree-sitter uses bytes, so `syntax::input_edit` converts between the two.
+- **Text is a `ropey::Rope`** built with `unicode_lines` off, so only `\n` ends
+  a line. Cloning is cheap, which the window's `Frame` snapshot relies on.
+- **Buffers end with `\n`.** The core plugin keeps this, and the files plugin
+  adds one when it loads a file.
+- **Async model:** `App` moves the `Session` into an iced `Task` for each batch
+  of key presses and gets it back in `Message::Done`. Keys pressed in the
+  meantime wait in `App::inbox`, and the view draws `Frame`. Plugin calls use
+  wasmtime `call_async`: they yield every epoch tick and are interrupted after
+  `CALL_TICKS` (init: `INIT_TICKS`). A plugin that traps or times out is
+  disabled for the rest of the run.
+- **During a plugin call, `Core` is moved into that plugin's store**
+  (`PluginHost::call`). Plugins can't call each other directly: `run-command`
+  and menu requests are queued, and `Session::follow_up` runs them after the
+  call returns (capped at `MAX_FOLLOW_UPS`).
+- **Buffers:** `Core::editor` is the current buffer, and the others live in
+  `Core::hidden`. The editor API always works on the current buffer. The mode
+  is shared by all buffers. Ids are never reused. Each buffer has its own core
+  plugin undo history (`follow_buffer`) and its own syntax tree (`Syntax`
+  keyed by `BufferId`). The yank register is shared.
+- **Syntax:** user grammars are `.wasm` files in `<config>/grammars/`, chosen
+  by `<config>/languages.toml` from the buffer name's extension. Queries are
+  in `<config>/queries/<lang>/highlights.scm`. Each batch's edits are reparsed
+  incrementally in `Session::update_syntax`; only visible lines are
+  highlighted. tree-sitter brings its own wasmtime (48), separate from the
+  plugin engine (50).
+- **Saving is the host's job.** `write` is an app command, next to `quit`, in
+  `session/mod.rs`. Plugins can bind it or `run-command` it, but they can't
+  write files themselves. A buffer's name is its path relative to the working
+  directory. Names in `*stars*` aren't files. Paths with `..` or absolute
+  paths are refused. Writes go to a temporary file, which is then renamed over
+  the target.
+- **Unsaved changes:** `Editor::is_modified` compares the text with the copy
+  kept at open or save (`mark_saved`), with a revision counter as the fast
+  path. `Session::start` marks the startup text saved, so core's final-newline
+  edit doesn't count. The `[+]` in the status bar, `buffer-info.modified`, and
+  the files plugin's refusal to close a modified buffer (`discard-buffer`
+  forces it) all come from this.
+- **Plugin sandboxing:** plugins get stdout and stderr only. The files plugin
+  is the exception, with read-only access to the working directory
+  (`Access::ReadWorkingDir`). User plugins (`<config>/plugins/*.wasm`) always
+  get `Access::None`.
+
+## Common changes
+
+**Adding or changing a host function:**
+1. Edit `wit/arrow.wit`. Bump the `package arrow:plugin@x.y.z` version when the
+   change breaks existing plugins.
+2. Implement it in `src/plugins/host_api.rs`, with state on `Core` or
+   `Registry` (registry fields are private; add a method).
+3. Bundled plugins pick up the new bindings on the next build.
+
+**Adding a bundled plugin:** create `plugins/<name>/` as a `cdylib` crate using
+`wit-bindgen` with `path: "../../wit"`. Add it to the workspace `members` in
+`Cargo.toml`, to `BUNDLED` in `build.rs`, and to `BUNDLED` in
+`src/plugins/mod.rs` with its `Access`. Load order matters: core comes first.
+
+**Writing tests:**
+- Session tests (`src/session/tests.rs`): `app(text)` starts a session with the
+  bundled plugins. `type_keys(&mut app, "ione<esc>")` takes Kakoune notation.
+  `run(&mut app, "open-file", "Cargo.toml")` runs a command with everything
+  that follows it.
+- Tests run from the repo root, so the files plugin sees the real tree
+  (`src/main.rs`, `Cargo.toml`, `tests/fixtures/...`).
+- Tests that write files use `test_dir(name)`, which gives an empty folder
+  under `target/arrow-test-writes/`. Never write to tracked files in a test.
+- Syntax tests use the demo grammar in `tests/fixtures/syntax`. To rebuild it,
+  use the command in `tests/fixtures/grammar-demo/grammar.js`.
+
+## Gotchas
+
+- When editing files with a script (Python or a heredoc in this shell), a
+  `\n` inside a replacement string has turned into a real newline and broken
+  Rust string literals. Use the Edit tool for any edit containing `\n`.
+- `Core` has private fields, so build it with `Core::new(editor, app_commands)`
+  rather than struct-update syntax.
+- The session test that opens `src/main.rs` checks the file's first line
+  (`//! Arrow`). Changing that line breaks the test.

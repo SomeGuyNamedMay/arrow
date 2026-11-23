@@ -15,10 +15,12 @@
 //! time limit is spent it is interrupted; a plugin that traps or times out is
 //! disabled.
 //!
+//! - [`buffers`]: the open buffers, and switching between them.
 //! - [`registry`]: what plugins have registered (modes, commands, bindings).
 //! - [`host_api`]: the functions plugins call.
 //! - this module: loading plugins, and lending them the [`Core`] for each call.
 
+mod buffers;
 mod host_api;
 mod registry;
 
@@ -36,6 +38,7 @@ use crate::components::text_editor::TextEditor;
 use crate::components::tree_menu::{TreeNode, TreeSpec};
 use crate::config::user_config_dir;
 use host_api::HostState;
+pub use buffers::{Buffer, BufferId};
 pub use registry::{Lookup, Registry};
 
 wasmtime::component::bindgen!({
@@ -131,7 +134,14 @@ pub fn user_plugin_dir() -> Option<PathBuf> {
 /// work they've asked for.
 #[derive(Default)]
 pub struct Core {
+    /// The current buffer, the one plugins edit and the window shows.
     pub editor: TextEditor,
+    /// The current buffer's id.
+    pub buffer_id: BufferId,
+    /// The other open buffers, in no particular order.
+    hidden: Vec<Buffer>,
+    /// The highest buffer id handed out so far, so ids are never reused.
+    last_buffer_id: BufferId,
     pub registry: Registry,
     /// Events waiting to be delivered.
     pub events: VecDeque<Event>,
@@ -149,6 +159,16 @@ pub struct Core {
 }
 
 impl Core {
+    /// A core whose first buffer (id 0) is `editor`, with the app's own commands
+    /// as (name, description).
+    pub fn new(editor: TextEditor, app_commands: Vec<(&'static str, &'static str)>) -> Self {
+        Self {
+            editor,
+            app_commands,
+            ..Self::default()
+        }
+    }
+
     pub fn is_command(&self, name: &str) -> bool {
         self.registry.command(name).is_some() || self.is_app_command(name)
     }

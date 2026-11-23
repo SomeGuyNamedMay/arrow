@@ -103,13 +103,13 @@ fn the_syntax_tree_follows_edits_made_through_plugins() {
     type_keys(&mut app, "c");
     type_keys(&mut app, "i{ <esc>");
     assert_eq!(text(&app), "{ let a = 1;\n{ let b = 2;\n");
-    let tree = app.syntax.as_ref().unwrap().tree().unwrap().root_node().to_sexp();
+    let tree = app.syntax.as_ref().unwrap().tree(app.core.buffer_id).unwrap().root_node().to_sexp();
     assert!(tree.starts_with("(source_file (ERROR"), "unclosed blocks: {tree}");
 
     // Undo restores the whole text in one replace; the tree still matches.
     type_keys(&mut app, "u");
     assert_eq!(text(&app), "let a = 1;\nlet b = 2;\n");
-    let tree = app.syntax.as_ref().unwrap().tree().unwrap().root_node().to_sexp();
+    let tree = app.syntax.as_ref().unwrap().tree(app.core.buffer_id).unwrap().root_node().to_sexp();
     assert_eq!(
         tree,
         "(source_file (binding name: (identifier) (number)) (binding name: (identifier) (number)))"
@@ -117,7 +117,7 @@ fn the_syntax_tree_follows_edits_made_through_plugins() {
 
     type_keys(&mut app, "%dilet c = \"done\";<esc>");
     assert_eq!(text(&app), "let c = \"done\";\n");
-    let tree = app.syntax.as_ref().unwrap().tree().unwrap().root_node().to_sexp();
+    let tree = app.syntax.as_ref().unwrap().tree(app.core.buffer_id).unwrap().root_node().to_sexp();
     assert_eq!(tree, "(source_file (binding name: (identifier) (string)))");
     assert!(app.core.editor.highlighter().is_some());
 }
@@ -417,7 +417,10 @@ fn file_manager_browses_and_opens_files() {
     let mut app = app("scratch");
     type_keys(&mut app, "<space>f");
     assert!(app.tree.is_open());
-    // Directories come first, sorted by name; hidden ones like .git are left out.
+    // The open buffers come first, then directories sorted by name; hidden
+    // ones like .git are left out.
+    assert_eq!(app.tree.highlighted_value(), Some("/buffers"));
+    type_keys(&mut app, "j");
     assert_eq!(app.tree.highlighted_value(), Some("plugins"));
 
     highlight(&mut app, "src");
@@ -433,9 +436,8 @@ fn file_manager_browses_and_opens_files() {
     assert_eq!(app.core.editor.editor().name(), "src/main.rs");
     assert_eq!(message(&app), "opened src/main.rs");
 
-    // Loading a file is an undoable change like any other.
-    type_keys(&mut app, "u");
-    assert_eq!(text(&app), "scratch\n");
+    // The file has a buffer of its own; the scratch buffer is still there.
+    assert_eq!(buffer_names(&app), ["*scratch*", "src/main.rs"]);
 }
 
 #[test]
@@ -446,7 +448,189 @@ fn file_manager_closes_with_escape_and_only_it_can_read_files() {
     // Plugins without file access can't open files: the command belongs to
     // the files plugin, which runs it in its own sandbox.
     type_keys(&mut app, ":open-file<ret>");
-    assert!(message(&app).contains("needs a path"), "{}", message(&app));
+    assert!(message(&app).contains("needs an argument"), "{}", message(&app));
+}
+
+// ----- Buffers -----
+
+fn buffer_names(app: &App) -> Vec<String> {
+    app.core.buffers().into_iter().map(|b| b.name).collect()
+}
+
+/// Run a command the way a key binding would, with everything that follows.
+fn run(app: &mut App, name: &str, arg: &str) {
+    block_on(async {
+        let before = app.observe();
+        app.run_command(name, Some(arg.to_string())).await;
+        app.emit_changes(before);
+        app.follow_up().await;
+        app.sync_menus().await;
+        app.update_syntax();
+    });
+}
+
+#[test]
+fn switching_buffers_keeps_each_ones_text_dots_and_undo() {
+    let mut app = app("scratch");
+    type_keys(&mut app, "ione <esc>");
+    assert_eq!(text(&app), "one scratch\n");
+
+    run(&mut app, "open-file", "Cargo.toml");
+    assert_eq!(message(&app), "opened Cargo.toml");
+    assert!(text(&app).starts_with("[package]"));
+    // Opening a file isn't an undoable edit of the buffer it opened in, and
+    // undo here doesn't reach the scratch buffer's history.
+    let file = text(&app);
+    type_keys(&mut app, "u");
+    assert_eq!(text(&app), file);
+
+    type_keys(&mut app, "litwo<esc>");
+    let edited = text(&app);
+    assert!(edited.starts_with("[two"), "{edited}");
+
+    // Back to the scratch buffer: its text and history are as they were left.
+    run(&mut app, "switch-buffer", "0");
+    assert_eq!(message(&app), "switched to *scratch*");
+    assert_eq!(text(&app), "one scratch\n");
+    type_keys(&mut app, "u");
+    assert_eq!(text(&app), "scratch\n");
+
+    // Opening the file again switches to its buffer, unsaved edit and all.
+    run(&mut app, "open-file", "Cargo.toml");
+    assert_eq!(message(&app), "switched to Cargo.toml");
+    assert_eq!(text(&app), edited);
+    assert_eq!(buffer_names(&app), ["*scratch*", "Cargo.toml"]);
+    type_keys(&mut app, "u");
+    assert_eq!(text(&app), file, "its own undo history came back with it");
+}
+
+#[test]
+fn buffers_are_switched_from_the_tree_menus() {
+    let mut app = app("scratch");
+    run(&mut app, "open-file", "Cargo.toml");
+
+    // <space>b lists the open buffers; choosing one switches to it.
+    type_keys(&mut app, "<space>b");
+    assert!(app.tree.is_open());
+    highlight(&mut app, "0");
+    type_keys(&mut app, "<ret>");
+    assert!(!app.tree.is_open());
+    assert_eq!(app.core.buffer_id, 0);
+    assert_eq!(text(&app), "scratch\n");
+
+    // The file manager's first entry holds them too.
+    type_keys(&mut app, "<space>f");
+    highlight(&mut app, "/buffers");
+    type_keys(&mut app, "l");
+    highlight(&mut app, "/buffers/1");
+    type_keys(&mut app, "<ret>");
+    assert_eq!(app.core.editor.editor().name(), "Cargo.toml");
+    assert_eq!(message(&app), "switched to Cargo.toml");
+}
+
+#[test]
+fn closing_a_buffer_shows_another_and_keeps_the_last() {
+    let mut app = app("scratch");
+    run(&mut app, "open-file", "Cargo.toml");
+    type_keys(&mut app, "<space>k");
+    assert_eq!(message(&app), "closed Cargo.toml; now in *scratch*");
+    assert_eq!(buffer_names(&app), ["*scratch*"]);
+    type_keys(&mut app, "<space>k");
+    assert_eq!(message(&app), "files: can't close the only buffer");
+    assert_eq!(text(&app), "scratch\n");
+}
+
+// ----- Writing -----
+
+/// An empty directory for one test's files, inside the working directory (the
+/// only place buffers can be written) and under `target/`, which git ignores.
+fn test_dir(name: &str) -> String {
+    let dir = format!("target/arrow-test-writes/{name}");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn modified(app: &App) -> bool {
+    app.core.editor.editor().is_modified()
+}
+
+#[test]
+fn writing_saves_the_buffer_to_its_file() {
+    let dir = test_dir("save");
+    let path = format!("{dir}/notes.txt");
+    std::fs::write(&path, "first line\n").unwrap();
+    let mut app = app("");
+    run(&mut app, "open-file", &path);
+    assert!(!modified(&app), "a freshly opened file has no unsaved changes");
+
+    type_keys(&mut app, "isecond <esc>");
+    assert!(modified(&app));
+    let listed = app.core.buffers().into_iter().find(|b| b.name == path).unwrap();
+    assert!(listed.modified);
+
+    type_keys(&mut app, "<c-s>");
+    assert_eq!(message(&app), format!("wrote {path}"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "second first line\n");
+    assert!(!modified(&app));
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(left.len(), 1, "no temporary file is left behind");
+
+    // Undoing past the save makes it differ from the file again.
+    type_keys(&mut app, "u");
+    assert!(modified(&app));
+}
+
+#[test]
+fn writing_needs_a_file_inside_the_working_directory() {
+    let dir = test_dir("save-as");
+    let mut app = app("hello");
+    assert!(!modified(&app), "startup edits don't count as unsaved");
+    type_keys(&mut app, "<c-s>");
+    assert!(message(&app).contains("isn't a file"), "{}", message(&app));
+
+    // Given a path, the buffer is written there and takes its name.
+    let path = format!("{dir}/hello.txt");
+    run(&mut app, "write", &path);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+    assert_eq!(app.core.editor.editor().name(), path);
+
+    run(&mut app, "write", "../arrow-outside.txt");
+    assert!(message(&app).contains("outside the working directory"), "{}", message(&app));
+    assert!(!std::path::Path::new("../arrow-outside.txt").exists());
+}
+
+#[test]
+fn buffers_with_unsaved_changes_need_discarding_to_close() {
+    let mut app = app("scratch");
+    run(&mut app, "open-file", "Cargo.toml");
+    type_keys(&mut app, "ix<esc>");
+    type_keys(&mut app, "<space>k");
+    assert!(message(&app).contains("unsaved changes"), "{}", message(&app));
+    assert_eq!(buffer_names(&app), ["*scratch*", "Cargo.toml"]);
+
+    run(&mut app, "discard-buffer", "");
+    assert_eq!(message(&app), "closed Cargo.toml; now in *scratch*");
+    assert_eq!(buffer_names(&app), ["*scratch*"]);
+}
+
+#[test]
+fn each_buffer_keeps_its_own_highlighting() {
+    let mut app = app("scratch");
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/syntax");
+    app.syntax = Some(Syntax::new(Languages::load(&fixtures).unwrap()).unwrap());
+    run(&mut app, "open-file", "tests/fixtures/syntax/example.demo");
+    let demo = app.core.buffer_id;
+    assert!(app.core.editor.highlighter().is_some());
+
+    run(&mut app, "switch-buffer", "0");
+    assert!(app.core.editor.highlighter().is_none(), "the scratch buffer has no language");
+    run(&mut app, "switch-buffer", &demo.to_string());
+    assert!(app.core.editor.highlighter().is_some());
+    // Edits after switching back still update the same buffer's tree.
+    type_keys(&mut app, "%dilet z = 0;<esc>");
+    let tree = app.syntax.as_ref().unwrap().tree(demo).unwrap().root_node().to_sexp();
+    assert_eq!(tree, "(source_file (binding name: (identifier) (number)))");
 }
 
 #[test]

@@ -1,5 +1,5 @@
 //! Builds the bundled plugins in `plugins/` as WebAssembly components and copies
-//! them into `OUT_DIR`, where `src/plugins.rs` embeds them with `include_bytes!`.
+//! them into `OUT_DIR`, where `src/plugins/mod.rs` embeds them with `include_bytes!`.
 
 use std::{env, path::PathBuf, process::Command};
 

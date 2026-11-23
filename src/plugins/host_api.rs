@@ -107,6 +107,36 @@ impl host_editor::Host for HostState {
             .replace(start as usize, end as usize, &text);
     }
 
+    fn open_buffer(&mut self, name: String, text: String) -> u32 {
+        self.core().open_buffer(&name, &text)
+    }
+
+    fn switch_buffer(&mut self, id: u32) -> bool {
+        self.core().switch_buffer(id)
+    }
+
+    fn close_buffer(&mut self, id: u32) -> Result<(), String> {
+        self.core().close_buffer(id)
+    }
+
+    fn get_buffer_id(&mut self) -> u32 {
+        self.core().buffer_id
+    }
+
+    fn list_buffers(&mut self) -> Vec<types::BufferInfo> {
+        self.core()
+            .buffers()
+            .into_iter()
+            .map(|buffer| types::BufferInfo {
+                id: buffer.id,
+                name: buffer.name,
+                current: buffer.current,
+                len: buffer.len as u32,
+                modified: buffer.modified,
+            })
+            .collect()
+    }
+
     fn get_mode(&mut self) -> String {
         self.core().editor.editor().mode().to_string()
     }

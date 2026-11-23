@@ -11,6 +11,8 @@
 //! The text is a [`Rope`], so edits and line lookups take logarithmic time
 //! however large the buffer is. Positions are character indices.
 
+use std::cell::Cell;
+
 use ropey::Rope;
 use tree_sitter::InputEdit;
 
@@ -66,19 +68,55 @@ pub struct Editor {
     name: String,
     /// Changes since the syntax tree last caught up, in the order they were made.
     edits: Vec<InputEdit>,
+    /// The text as it was when the buffer was opened or last saved.
+    saved: Rope,
+    /// Counts changes, so "unchanged since saved" is cheap to check.
+    revision: u64,
+    saved_revision: u64,
+    /// The last answer to `is_modified`, and the revision it was for.
+    modified: Cell<Option<(u64, bool)>>,
 }
 
 impl Editor {
+    /// A buffer holding `text`, which counts as saved.
     pub fn new(text: &str) -> Self {
+        let text = Rope::from_str(text);
         Self {
-            text: Rope::from_str(text),
+            saved: text.clone(),
+            text,
             dots: vec![Selection::point(0)],
             mode: INITIAL_MODE.to_string(),
             inserting: false,
             message: None,
             name: "*scratch*".to_string(),
             edits: Vec::new(),
+            revision: 0,
+            saved_revision: 0,
+            modified: Cell::new(None),
         }
+    }
+
+    /// Whether the text differs from what was opened or last saved. Undoing
+    /// back to the saved text counts as unmodified.
+    pub fn is_modified(&self) -> bool {
+        if self.revision == self.saved_revision {
+            return false;
+        }
+        if let Some((revision, modified)) = self.modified.get()
+            && revision == self.revision
+        {
+            return modified;
+        }
+        // Ropes compare lengths first, so most changes are found quickly.
+        let modified = self.text != self.saved;
+        self.modified.set(Some((self.revision, modified)));
+        modified
+    }
+
+    /// Record that the current text is what's on disk.
+    pub fn mark_saved(&mut self) {
+        self.saved = self.text.clone();
+        self.saved_revision = self.revision;
     }
 
     /// The changes made since the last call, for the syntax tree.
@@ -194,6 +232,7 @@ impl Editor {
         self.edits.push(syntax::input_edit(&self.text, start, end, text));
         self.text.remove(start..end);
         self.text.insert(start, text);
+        self.revision += 1;
         self.dots = self.dots.iter().map(|dot| self.clamp(*dot)).collect();
     }
 
@@ -236,6 +275,21 @@ mod tests {
 
     fn text(editor: &Editor) -> String {
         editor.slice(0, editor.len())
+    }
+
+    #[test]
+    fn modified_means_different_from_the_saved_text() {
+        let mut editor = Editor::new("abc");
+        assert!(!editor.is_modified(), "a new buffer counts as saved");
+        editor.replace(0, 0, "x");
+        assert!(editor.is_modified());
+        // Changing it back, as undo does, counts as unmodified again.
+        editor.replace(0, 1, "");
+        assert!(!editor.is_modified());
+        editor.replace(3, 3, "!");
+        editor.mark_saved();
+        assert!(!editor.is_modified());
+        assert_eq!(text(&editor), "abc!");
     }
 
     #[test]

@@ -230,7 +230,14 @@ impl TextEditor {
         container(
             row![
                 label(status).width(Fill),
-                label(format!("{} {}:{}", self.editor.name(), line + 1, column + 1)),
+                label(format!(
+                    "{}{} {}:{}",
+                    self.editor.name(),
+                    // Unsaved changes, as in Vim.
+                    if self.editor.is_modified() { " [+]" } else { "" },
+                    line + 1,
+                    column + 1
+                )),
                 label(match self.editor.dots().len() {
                     1 => format!("{} sel", self.editor.selection().len()),
                     dots => format!("{dots} dots · {} sel", self.editor.selection().len()),

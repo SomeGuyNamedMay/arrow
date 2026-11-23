@@ -18,9 +18,14 @@ use crate::syntax::{Languages, Syntax};
 
 #[cfg(test)]
 pub(crate) mod tests;
+mod write;
 
-/// Commands provided by the app itself, because they control the window.
-const APP_COMMANDS: &[(&str, &str)] = &[("quit", "Close Arrow")];
+/// Commands provided by the app itself: they control the window, or reach
+/// outside the plugins' sandbox.
+const APP_COMMANDS: &[(&str, &str)] = &[
+    ("quit", "Close Arrow"),
+    ("write", "Save the buffer to its file (or to the path given)"),
+];
 
 /// Most events and queued commands handled after one action, so plugins that keep
 /// triggering each other can't hang the editor.
@@ -58,11 +63,7 @@ struct Observed {
 impl Session {
     /// A session with the bundled plugins, and the user's plugins if asked.
     pub async fn start(text: &str, user_plugins: bool) -> Self {
-        let mut core = Core {
-            editor: TextEditor::new(text),
-            app_commands: APP_COMMANDS.to_vec(),
-            ..Default::default()
-        };
+        let mut core = Core::new(TextEditor::new(text), APP_COMMANDS.to_vec());
         let mut plugins = PluginHost::new();
         let mut errors = plugins.load_bundled(&mut core).await;
         if user_plugins {
@@ -94,6 +95,9 @@ impl Session {
         session.follow_up().await;
         session.sync_menus().await;
         session.update_syntax();
+        // Edits plugins made while starting up (like core adding the final
+        // newline) don't count as unsaved changes.
+        session.core.editor.editor_mut().mark_saved();
         for error in errors {
             session.report(error);
         }
@@ -117,7 +121,7 @@ impl Session {
         let Some(syntax) = &mut self.syntax else {
             return;
         };
-        if let Err(error) = syntax.update(&mut self.core.editor) {
+        if let Err(error) = syntax.update(self.core.buffer_id, &mut self.core.editor) {
             self.report(error);
         }
     }
@@ -228,6 +232,13 @@ impl Session {
     async fn run_command(&mut self, name: &str, arg: Option<String>) {
         match name {
             "quit" => self.quit = true,
+            "write" => {
+                let editor = self.core.editor.editor_mut();
+                match write::write_buffer(editor, arg.as_deref()) {
+                    Ok(path) => editor.set_message(format!("wrote {path}")),
+                    Err(error) => self.report(error),
+                }
+            }
             _ => {
                 let Some(command) = self.core.registry.command(name) else {
                     self.report(format!("no such command: {name}"));

@@ -23,7 +23,7 @@ fn demo_buffer(text: &str) -> TextEditor {
 }
 
 fn sexp(syntax: &Syntax) -> String {
-    syntax.tree().unwrap().root_node().to_sexp()
+    syntax.tree(0).unwrap().root_node().to_sexp()
 }
 
 fn hex(color: Option<Color>) -> String {
@@ -37,7 +37,7 @@ fn hex(color: Option<Color>) -> String {
 fn the_buffer_name_picks_the_language() {
     let mut syntax = syntax();
     let mut editor = demo_buffer("let x = 1;\n");
-    syntax.update(&mut editor).unwrap();
+    syntax.update(0, &mut editor).unwrap();
     assert_eq!(
         sexp(&syntax),
         "(source_file (binding name: (identifier) (number)))"
@@ -46,8 +46,8 @@ fn the_buffer_name_picks_the_language() {
 
     // A name with no configured language turns highlighting off.
     editor.editor_mut().set_name("notes.txt".into());
-    syntax.update(&mut editor).unwrap();
-    assert!(syntax.tree().is_none());
+    syntax.update(0, &mut editor).unwrap();
+    assert!(syntax.tree(0).is_none());
     assert!(editor.highlighter().is_none());
 }
 
@@ -55,7 +55,7 @@ fn the_buffer_name_picks_the_language() {
 fn incremental_parses_match_a_fresh_parse() {
     let mut syntax = syntax();
     let mut editor = demo_buffer("let a = 1;\n{ let b = \"two\"; }\n");
-    syntax.update(&mut editor).unwrap();
+    syntax.update(0, &mut editor).unwrap();
     // Edits on several lines, multi-line inserts and non-ASCII text, all
     // applied in one batch the way a multi-dot command does.
     let text = editor.editor_mut();
@@ -63,11 +63,11 @@ fn incremental_parses_match_a_fresh_parse() {
     text.replace(0, 0, "# héllo\nlet z = 9;\n");
     let end = text.len();
     text.replace(end, end, "{\n  { let c = d; }\n}\n");
-    syntax.update(&mut editor).unwrap();
+    syntax.update(0, &mut editor).unwrap();
 
     let mut fresh = self::syntax();
     let mut copy = demo_buffer(&editor.editor().slice(0, editor.editor().len()));
-    fresh.update(&mut copy).unwrap();
+    fresh.update(0, &mut copy).unwrap();
     assert_eq!(sexp(&syntax), sexp(&fresh));
     assert!(!sexp(&syntax).contains("ERROR"), "{}", sexp(&syntax));
 }
@@ -76,7 +76,7 @@ fn incremental_parses_match_a_fresh_parse() {
 fn highlights_use_the_theme_innermost_and_first_pattern_first() {
     let mut syntax = syntax();
     let mut editor = demo_buffer("let x = y; # é\n");
-    syntax.update(&mut editor).unwrap();
+    syntax.update(0, &mut editor).unwrap();
     let rope = editor.editor().rope();
     let colors = editor.highlighter().unwrap().colors(rope, 0..rope.len_chars());
     let at = |i: usize| hex(colors[i]);
@@ -100,10 +100,10 @@ fn missing_grammars_and_bad_config_are_reported() {
     let mut syntax = syntax();
     let mut editor = TextEditor::new("anything\n");
     editor.editor_mut().set_name("file.missing".into());
-    let error = syntax.update(&mut editor).unwrap_err();
+    let error = syntax.update(0, &mut editor).unwrap_err();
     assert!(error.contains("missing.wasm"), "{error}");
     // Reported once, not on every key.
-    assert!(syntax.update(&mut editor).is_ok());
+    assert!(syntax.update(0, &mut editor).is_ok());
 
     assert!(parse_color("#12345").is_none());
     assert_eq!(hex(parse_color("#0a0B0c")), "#0a0b0c");

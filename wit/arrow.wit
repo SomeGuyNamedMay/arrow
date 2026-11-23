@@ -1,4 +1,4 @@
-package arrow:plugin@0.6.0;
+package arrow:plugin@0.8.0;
 
 interface types {
     record selection {
@@ -104,6 +104,19 @@ interface types {
         on-expand: option<string>,
     }
 
+    /// An open buffer, as listed by `list-buffers`.
+    record buffer-info {
+        id: u32,
+        /// Its name, e.g. a file path, or "*scratch*".
+        name: string,
+        /// Whether it is the current buffer, the one the editor shows.
+        current: bool,
+        /// Length in characters.
+        len: u32,
+        /// Whether its text differs from when it was opened or last written.
+        modified: bool,
+    }
+
     /// A key binding, as listed by `list-bindings`.
     record binding-info {
         mode: string,
@@ -121,12 +134,16 @@ interface types {
 /// plugin). Its one rule is that dot positions are kept inside the text (pulled
 /// back to the last character if needed), so the view can always draw them.
 ///
+/// There can be several buffers open, each with its own text and dots; every
+/// function here works on the current one. The mode is the editor's, shared by
+/// all buffers.
+///
 /// Positions are character indices. Dots are the editor's cursors: each is a
 /// selection covering `min(anchor, cursor)..=max(anchor, cursor)`. They are kept
 /// in the order plugins set them, conventionally oldest first; the last one is
 /// the primary dot, which the view follows. There is always at least one.
 interface editor {
-    use types.{selection};
+    use types.{selection, buffer-info};
 
     len: func() -> u32;
     char-at: func(index: u32) -> option<char>;
@@ -153,12 +170,32 @@ interface editor {
     get-buffer-name: func() -> string;
     set-buffer-name: func(name: string);
 
+    /// Open a buffer named `name` holding `text`, make it current and return
+    /// its id. If a buffer with that name is already open, switch to it instead
+    /// and keep its text (and any unsaved edits); `text` is ignored.
+    open-buffer: func(name: string, text: string) -> u32;
+    /// Make the buffer with this id current. Returns false if there is none.
+    switch-buffer: func(id: u32) -> bool;
+    /// Close a buffer, discarding its text. Closing the current buffer makes
+    /// the most recently opened other buffer current. The last buffer can't be
+    /// closed. Ids aren't reused.
+    close-buffer: func(id: u32) -> result<_, string>;
+    /// The current buffer's id. The buffer the editor starts with is 0.
+    get-buffer-id: func() -> u32;
+    /// Every open buffer, in the order they were opened.
+    list-buffers: func() -> list<buffer-info>;
+
     /// Show a message in the status bar until the next key press.
     message: func(text: string);
 
     /// Run any command by name after the current plugin call returns, with an
     /// optional argument. Returns false if no command has that name. A
     /// `takes-char` command run without an argument waits for a typed character.
+    ///
+    /// Besides plugin commands, the host has its own: `quit`, and `write`, which
+    /// saves the current buffer to the file it is named after (or to the path in
+    /// `arg`, renaming the buffer). Only files inside the working directory can
+    /// be written; plugins can't write files themselves.
     run-command: func(name: string, arg: option<string>) -> bool;
 }
 

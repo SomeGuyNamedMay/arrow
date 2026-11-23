@@ -6,11 +6,13 @@
 //!
 //! The editor only stores text and dots, so all behaviour lives here: moving and
 //! resizing dots, shifting every dot when the text changes ([`edit`]), merging
-//! dots that overlap, keeping a final newline, and undo history. It uses the same
+//! dots that overlap, keeping a final newline, and undo history (one per buffer;
+//! the yank register is shared, so text can be copied between buffers). It uses the same
 //! `editor` and `registry` interfaces (`wit/arrow.wit`) any other plugin uses, so a
 //! plugin loaded later can replace any of these commands or bindings.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 wit_bindgen::generate!({
     world: "plugin",
@@ -49,6 +51,7 @@ impl Guest for Core {
     }
 
     fn run_command(name: String, arg: Option<String>) {
+        follow_buffer();
         let arg = arg.as_deref();
         let Some(command) = COMMANDS.iter().find(|c| c.name == name) else {
             ed::message(&format!("core has no command `{name}`"));
@@ -98,6 +101,16 @@ struct State {
     register: Vec<String>,
     /// Commands run from the command menu, most recent first.
     recent_commands: Vec<String>,
+    /// The buffer `history` belongs to.
+    buffer: u32,
+    history: History,
+    /// The other buffers' histories, kept while they aren't current.
+    parked: HashMap<u32, History>,
+}
+
+/// What belongs to one buffer: its undo history, and where its dots aim.
+#[derive(Default)]
+struct History {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// State at the start of the current undo group, if one is open. A group
@@ -114,6 +127,22 @@ thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
     /// The dot the current per-dot command is working on.
     static DOT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Use the current buffer's history. If another buffer became current since our
+/// last command, park the old buffer's history and pick up the new one's (a
+/// buffer we haven't seen starts with none).
+fn follow_buffer() {
+    let current = ed::get_buffer_id();
+    STATE.with(|s| {
+        let state = &mut *s.borrow_mut();
+        if state.buffer != current {
+            let previous = std::mem::take(&mut state.history);
+            state.parked.insert(state.buffer, previous);
+            state.history = state.parked.remove(&current).unwrap_or_default();
+            state.buffer = current;
+        }
+    });
 }
 
 /// Copy every dot's text into the register.
@@ -454,6 +483,8 @@ const NORMAL_BINDINGS: &[(&str, &str)] = &[
     ("<lt>", "dedent"),
     ("u", "undo"),
     ("U", "redo"),
+    // The host's own command: plugins can bind it, but only the host writes.
+    ("<c-s>", "write"),
 ];
 
 const INSERT_BINDINGS: &[(&str, &str)] = &[
@@ -468,6 +499,7 @@ const INSERT_BINDINGS: &[(&str, &str)] = &[
     ("<down>", "move-down"),
     ("<home>", "goto-line-start"),
     ("<end>", "goto-line-newline"),
+    ("<c-s>", "write"),
 ];
 
 const INDENT: &str = "    ";
@@ -652,14 +684,14 @@ fn begin_undo_group() {
     let now = snapshot();
     STATE.with(|s| {
         let mut state = s.borrow_mut();
-        if state.group.is_none() {
-            if let Some(known) = state.known.take()
+        if state.history.group.is_none() {
+            if let Some(known) = state.history.known.take()
                 && known.text != now.text
             {
-                state.undo.push(known);
-                state.redo.clear();
+                state.history.undo.push(known);
+                state.history.redo.clear();
             }
-            state.group = Some(now);
+            state.history.group = Some(now);
         }
     });
 }
@@ -676,18 +708,18 @@ fn close_undo_group() {
     let text = ed::slice(0, ed::len());
     STATE.with(|s| {
         let mut state = s.borrow_mut();
-        if let Some(group) = state.group.take()
+        if let Some(group) = state.history.group.take()
             && group.text != text
         {
-            state.undo.push(group);
-            state.redo.clear();
+            state.history.undo.push(group);
+            state.history.redo.clear();
         }
     });
 }
 
 fn remember_state() {
     let now = snapshot();
-    STATE.with(|s| s.borrow_mut().known = Some(now));
+    STATE.with(|s| s.borrow_mut().history.known = Some(now));
 }
 
 /// Undo (or redo) one step. Returns false if there is nothing to step to.
@@ -699,9 +731,9 @@ fn step_history(undo: bool) -> bool {
     let target = STATE.with(|s| {
         let state = &mut *s.borrow_mut();
         let (from, to) = if undo {
-            (&mut state.undo, &mut state.redo)
+            (&mut state.history.undo, &mut state.history.redo)
         } else {
-            (&mut state.redo, &mut state.undo)
+            (&mut state.history.redo, &mut state.history.undo)
         };
         let target = from.pop()?;
         to.push(current);
@@ -864,7 +896,7 @@ fn move_horizontal(forward: bool, extend: bool) {
 fn move_vertical(down: bool, extend: bool) {
     let index = DOT.get() as usize;
     let from = cursor();
-    let goal = STATE.with(|s| s.borrow().goals.get(index).copied().flatten());
+    let goal = STATE.with(|s| s.borrow().history.goals.get(index).copied().flatten());
     let column = match goal {
         Some((column, at)) if at == from => column,
         _ => column(from),
@@ -881,7 +913,7 @@ fn move_vertical(down: bool, extend: bool) {
     };
     move_to(pos, extend);
     STATE.with(|s| {
-        let goals = &mut s.borrow_mut().goals;
+        let goals = &mut s.borrow_mut().history.goals;
         if goals.len() <= index {
             goals.resize(index + 1, None);
         }

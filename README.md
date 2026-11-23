@@ -1,60 +1,146 @@
-# arrow
+# Arrow
 
-A small Rust compiler scaffold using [nom](https://docs.rs/nom) for parsing and [Cranelift](https://docs.rs/cranelift) for native JIT compilation.
+A modal text editor in the style of [Kakoune](https://kakoune.org), written in
+Rust. The editor itself only stores text and draws it. **Everything it does
+(modes, motions, editing, undo, key bindings, the file manager) comes from
+plugins**, which are sandboxed WebAssembly components. A plugin you write
+uses the same API as the built-in ones and can replace any of them.
 
-Expressions support integers, addition, subtraction, and multiplication:
+Arrow is early work: it edits text, browses, opens and saves files, keeps
+several buffers and highlights syntax.
+
+## Building
+
+You need:
+
+- Rust (2024 edition) and the WebAssembly target the plugins are built for:
+  ```sh
+  rustup target add wasm32-wasip2
+  ```
+- `cmake` on your PATH. tree-sitter's WebAssembly support uses it while
+  building. On Windows it comes with Visual Studio Build Tools, or install it
+  with `winget install Kitware.CMake`.
+
+Then:
 
 ```sh
-cargo run -- "1 + 2 * 3"
+cargo run      # build the bundled plugins and start the editor
+cargo test     # unit tests, and end-to-end tests through the real plugins
 ```
 
-Run the parser tests with:
+The bundled plugins in `plugins/` are built automatically by `build.rs` and
+embedded in the executable.
+
+## Using it
+
+Editing happens at **dots**: cursors that are also selections. You select
+first, then act, and every command acts at every dot at once.
+
+| Keys | What they do |
+|---|---|
+| `h` `j` `k` `l`, arrows | move (uppercase, or Shift+arrow, extends the dot instead) |
+| `w` `e` `b` | select the next word, to the word's end, the previous word (`W` `E` `B` extend) |
+| `x`, `%` | select the line, select everything |
+| `gh` `gl` `gg` `ge` | go to line start, line end, buffer start, buffer end (`G…` extends) |
+| `c`, `,` | add a dot on the line below the newest one, remove the oldest dot |
+| `i` `a` `I` `A` `o` `O` | insert before, after, at line start, at line end, on a new line below or above |
+| `Esc` | back to normal mode |
+| `d` `s` `y` `p` `P` `R` | delete, change, yank, paste after, paste before, replace with yank |
+| `r`, `~`, `` ` `` | replace characters, uppercase, lowercase |
+| `>` `<` | indent, dedent |
+| `u` `U` | undo, redo |
+| `:` or `Alt-x` | command menu: type to filter, Enter to run |
+| `?` | list every key binding and what it does |
+| `Space f` | file manager (ranger style; `h` `j` `k` `l` to move, Enter to open) |
+| `Space b` | switch between open buffers |
+| `Ctrl-s` or `:write` | save the buffer to its file |
+| `Space k` | close the current buffer (refused if it has unsaved changes; `:discard-buffer` closes it anyway) |
+| `Alt-s`, `Space d`, `Space c` | sort lines, duplicate line, count words (from the text-tools plugin) |
+
+Opening a file gives it a buffer of its own. Opening it again switches back to
+that buffer, unsaved edits included. Each buffer has its own undo history,
+and the yank register is shared, so you can copy between files.
+
+A buffer with unsaved changes shows `[+]` after its name in the status bar,
+and is marked "modified" in the buffer list. Undoing back to the saved text
+clears the mark. Saving writes to a temporary file that then replaces the
+original, so a failed save never leaves half a file. Only files inside the
+folder Arrow was started in can be written.
+
+## Configuration
+
+Arrow reads your setup from `%APPDATA%\arrow` on Windows, or
+`$XDG_CONFIG_HOME/arrow` (usually `~/.config/arrow`) elsewhere:
+
+```
+arrow/
+  plugins/*.wasm                    your plugins, loaded at startup
+  languages.toml                    which grammar to use for which files
+  grammars/<grammar>.wasm           tree-sitter grammars
+  queries/<language>/highlights.scm highlight queries
+```
+
+### Syntax highlighting
+
+Highlighting uses [tree-sitter](https://tree-sitter.github.io) grammars
+compiled to WebAssembly, so a grammar runs sandboxed and the same file works
+on every platform. Build one from a grammar repository with the tree-sitter
+CLI, and copy the repository's `queries/highlights.scm` alongside it:
 
 ```sh
-cargo test
+tree-sitter build --wasm -o rust.wasm
 ```
 
-## Language features
+Then list the language in `languages.toml`:
 
-Syntax highlighting and text objects use an internal AST returned by a
-language-specific Python parser callback; they do not use LSP or Tree-sitter.
-The parser receives the complete source and returns nodes created with
-`arrow.ast_node(kind, start, end, children=(), capture=None)`. Offsets are
-zero-based Unicode character positions, with an exclusive end. The editor
-validates node ranges and uses `capture` names for highlighting and `kind`
-names for configured text objects.
+```toml
+[[language]]
+name = "rust"
+extensions = ["rs"]
+# grammar = "rust"                            (default: the name)
+# highlights = "queries/rust/highlights.scm"  (default)
 
-For example:
-
-```python
-def parse_example(source):
-    start = source.find("fn ")
-    if start < 0:
-        return arrow.ast_node("module", 0, len(source))
-    end = len(source)
-    return arrow.ast_node("module", 0, end, [
-        arrow.ast_node("function", start, end, [
-            arrow.ast_node("keyword", start, start + 2, capture="keyword")
-        ])
-    ])
-
-arrow.register_language(
-    "example",
-    ("example",),
-    parser=parse_example,
-    highlight_colors={"keyword": (0.78, 0.55, 0.96, 2)},
-    text_object_kinds=("function",),
-)
+[theme]
+keyword = "#c678dd"   # by capture name; "function.method" falls back to "function"
 ```
 
-Language registrations may also specify an optional LSP server with
-`command`, `args`, and `root_markers`; it remains available for features such
-as completion. The default Rust and Python registrations configure
-`rust-analyzer` and `pyright-langserver` for LSP features.
+The language follows the buffer's file extension, and the tree is updated
+incrementally as you edit.
 
-The default Rust and Python registrations also bundle parsers
-(`arrow.parse_rust` and `arrow.parse_python` in `python/defaults/syntax.py`).
-They are error-tolerant lexers that capture comments, strings, numbers,
-keywords, types, constants, macros, and function names, and that emit a
-`function` node for every function so `select-function` works. Register a
-language again with your own `parser` to replace them.
+## Writing plugins
+
+A plugin is a WebAssembly component for the `plugin` world in
+[`wit/arrow.wit`](wit/arrow.wit). It can:
+
+- read and change the text and the dots, open, switch and close buffers, and
+  see which have unsaved changes;
+- run any command, including the editor's own `write` (plugins can't write
+  files themselves);
+- define modes, register commands and bind keys (in Kakoune notation:
+  `"gh"`, `"<a-s>"`, `"<space>d"`);
+- subscribe to events: startup, buffer and selection changes, mode changes,
+  and commands run;
+- open menus and tree menus for the user to pick from.
+
+The easiest way to write one is Rust with
+[`wit-bindgen`](https://github.com/bytecodealliance/wit-bindgen), as the
+bundled plugins do. [`plugins/text-tools`](plugins/text-tools) is a small
+example. Build it for `wasm32-wasip2` and put the `.wasm` in your `plugins/`
+folder. Any language that can produce a component works too.
+
+Plugins are sandboxed: each has its own memory, and can reach nothing outside
+it but stdout and stderr (the bundled file manager also gets read-only access
+to the folder Arrow was started in). A plugin call that runs for more than
+about half a second is stopped, and a plugin that crashes or times out is
+disabled without taking the editor down.
+
+## How it's built
+
+Plugins run asynchronously, off the UI thread, so a slow one never freezes the
+window, and keys you press meanwhile are handled in order. Text is stored in a
+[rope](https://docs.rs/ropey), so edits stay fast in large files. See
+[`CLAUDE.md`](CLAUDE.md) for a map of the source and the design rules.
+
+## License
+
+GPL-3.0. See [`LICENSE`](LICENSE).
