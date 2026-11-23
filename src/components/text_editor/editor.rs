@@ -203,6 +203,47 @@ impl Editor {
         self.line_start(line) + chars - usize::from(newline)
     }
 
+    // ----- Line lookups by character index, for plugins -----
+    //
+    // Plugins used to find line boundaries by asking for one character at a
+    // time, which crossed the wasm boundary for every character on the line.
+    // The rope keeps a line index, so each of these is O(log n) instead. Their
+    // results match exactly what those character-by-character loops returned,
+    // including at the end of the text.
+
+    /// Index of the first character of the line containing `index`. Past the
+    /// end of the text, `index` itself.
+    pub fn line_start_of(&self, index: usize) -> usize {
+        if index > self.len() {
+            return index;
+        }
+        self.text.line_to_char(self.text.char_to_line(index))
+    }
+
+    /// Index of the newline ending the line containing `index`. On the last
+    /// character or beyond, `index` itself (that is where a scan would stop).
+    pub fn line_end_of(&self, index: usize) -> usize {
+        let len = self.len();
+        if len == 0 || index + 1 >= len {
+            return index;
+        }
+        // Below the last character, the line's newline (or, without a final
+        // newline, the end of the text, kept on the last character).
+        self.line_end(self.text.char_to_line(index)).min(len - 1)
+    }
+
+    /// Which line `index` is on, counting from 0: the number of newlines before
+    /// it. The difference between two of these counts the newlines between them.
+    pub fn line_index(&self, index: usize) -> usize {
+        self.text.char_to_line(index.min(self.len()))
+    }
+
+    /// Counts changes to the text. Plugins compare it to notice whether anything
+    /// changed without comparing the text itself.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// 0-based line and column of the primary dot's cursor.
     pub fn cursor_position(&self) -> (usize, usize) {
         let cursor = self.selection().cursor.min(self.len());
@@ -233,7 +274,57 @@ impl Editor {
         self.text.remove(start..end);
         self.text.insert(start, text);
         self.revision += 1;
-        self.dots = self.dots.iter().map(|dot| self.clamp(*dot)).collect();
+        let last = self.len().saturating_sub(1);
+        for dot in &mut self.dots {
+            dot.anchor = dot.anchor.min(last);
+            dot.cursor = dot.cursor.min(last);
+        }
+    }
+
+    /// Replace `start..end` (end exclusive) with `text` and shift every dot so it
+    /// keeps pointing at the same text: dots after the change move by its size,
+    /// and dot ends inside the replaced range move to its start.
+    ///
+    /// This is the core plugin's rule for keeping dots in place, done here so
+    /// that a plugin editing at many dots doesn't fetch and send back the whole
+    /// list of dots for every edit. The plugin still decides when to use it.
+    /// Shifting is one pass over the dots, in native code, with no copying.
+    pub fn replace_shifting(&mut self, start: usize, end: usize, text: &str) {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        let inserted = text.chars().count();
+        let shift = |pos: usize| {
+            if pos >= end {
+                pos - (end - start) + inserted
+            } else if pos >= start {
+                start
+            } else {
+                pos
+            }
+        };
+        // Shift before replacing: the rule is about positions in the old text.
+        // `replace` then clamps the dots to the new text.
+        for dot in &mut self.dots {
+            dot.anchor = shift(dot.anchor);
+            dot.cursor = shift(dot.cursor);
+        }
+        self.replace(start, end, text);
+    }
+
+    /// Replace the whole text and the dots with a copy taken earlier (for undo).
+    /// The rope is shared with the copy, not copied, so this takes O(1) time
+    /// however big the buffer is. Tree-sitter is told the whole text changed.
+    pub fn restore(&mut self, text: Rope, dots: &[Selection]) {
+        self.edits.push(syntax::whole_text_edit(&self.text, &text));
+        self.text = text;
+        self.revision += 1;
+        self.set_dots(dots);
+        // `set_dots` ignores an empty list; make sure old dots fit the new text.
+        let last = self.len().saturating_sub(1);
+        for dot in &mut self.dots {
+            dot.anchor = dot.anchor.min(last);
+            dot.cursor = dot.cursor.min(last);
+        }
     }
 
     /// Replace every dot. An empty list is ignored, since there must be a dot.
@@ -275,6 +366,78 @@ mod tests {
 
     fn text(editor: &Editor) -> String {
         editor.slice(0, editor.len())
+    }
+
+    /// The loops the core plugin used before the host had line lookups; the
+    /// lookups must agree with them everywhere, including past the end.
+    fn scanned_line_start(editor: &Editor, index: usize) -> usize {
+        let at = |i: usize| editor.char_at(i).unwrap_or('\n');
+        let mut start = index;
+        while start > 0 && at(start - 1) != '\n' {
+            start -= 1;
+        }
+        start
+    }
+
+    fn scanned_line_end(editor: &Editor, index: usize) -> usize {
+        let at = |i: usize| editor.char_at(i).unwrap_or('\n');
+        let last = editor.len() - 1;
+        let mut end = index;
+        while end < last && at(end) != '\n' {
+            end += 1;
+        }
+        end
+    }
+
+    #[test]
+    fn line_lookups_match_scanning() {
+        for text in ["ab\n\ncd\n", "one\ntwo", "\n", "x\n", "a\nb\nc\n"] {
+            let editor = Editor::new(text);
+            for index in 0..=editor.len() + 1 {
+                assert_eq!(
+                    editor.line_start_of(index),
+                    scanned_line_start(&editor, index),
+                    "line start of {index} in {text:?}"
+                );
+                assert_eq!(
+                    editor.line_end_of(index),
+                    scanned_line_end(&editor, index),
+                    "line end of {index} in {text:?}"
+                );
+            }
+        }
+        let editor = Editor::new("a\nb\nc\n");
+        assert_eq!(editor.line_index(4) - editor.line_index(1), 2);
+    }
+
+    #[test]
+    fn shifting_edits_keep_dots_on_their_text() {
+        let mut editor = Editor::new("one two three\n");
+        editor.set_dots(&[
+            Selection::point(0),
+            Selection { anchor: 4, cursor: 6 },
+            Selection::point(8),
+        ]);
+        // Replacing "two" with "2": the dot covering it shrinks to its start,
+        // and the dot after it moves back by two.
+        editor.replace_shifting(4, 7, "2");
+        assert_eq!(text(&editor), "one 2 three\n");
+        assert_eq!(
+            editor.dots(),
+            [Selection::point(0), Selection::point(4), Selection::point(6)]
+        );
+    }
+
+    #[test]
+    fn restoring_puts_back_text_and_dots() {
+        let mut editor = Editor::new("before\n");
+        let saved = editor.rope().clone();
+        editor.replace(0, 6, "after and longer");
+        editor.set_selection(Selection::point(10));
+        editor.restore(saved, &[Selection::point(2)]);
+        assert_eq!(text(&editor), "before\n");
+        assert_eq!(editor.dots(), [Selection::point(2)]);
+        assert_eq!(editor.take_edits().len(), 2, "tree-sitter hears of both changes");
     }
 
     #[test]

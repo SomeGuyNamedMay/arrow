@@ -1,4 +1,4 @@
-package arrow:plugin@0.8.0;
+package arrow:plugin@0.9.0;
 
 interface types {
     record selection {
@@ -151,6 +151,31 @@ interface editor {
     slice: func(start: u32, end: u32) -> string;
     /// Replace `start..end` (end exclusive) with `text`. Dots are not moved.
     replace: func(start: u32, end: u32, text: string);
+    /// Replace `start..end` like `replace`, and shift every dot so it keeps
+    /// pointing at the same text: dots after the change move by its size, and
+    /// dot ends inside the replaced range move to its start. One call instead of
+    /// `get-dots`, `replace` and `set-dots`, which matters with many dots.
+    edit: func(start: u32, end: u32, text: string);
+
+    /// Start of the line containing `index` (past the end: `index`).
+    line-start: func(index: u32) -> u32;
+    /// The newline ending the line containing `index` (on the last character or
+    /// past it: `index`). Both are O(log n), unlike scanning with `char-at`.
+    line-end: func(index: u32) -> u32;
+    /// Which line `index` is on, from 0: the number of newlines before it.
+    line-index: func(index: u32) -> u32;
+
+    /// Save the current buffer's text and dots, for undo, and return an id for
+    /// the copy. This is cheap however big the buffer is: the copy shares the
+    /// text with the buffer until either is edited. Drop it when done with it.
+    take-snapshot: func() -> u32;
+    /// Put the current buffer back as it was in a snapshot. False if the
+    /// snapshot is gone or belongs to another buffer.
+    restore-snapshot: func(id: u32) -> bool;
+    /// Whether the current buffer's text differs from a snapshot's. Usually
+    /// answered without comparing any text. A missing snapshot counts as changed.
+    changed-since: func(id: u32) -> bool;
+    drop-snapshot: func(id: u32);
 
     /// All dots, in order.
     get-dots: func() -> list<selection>;

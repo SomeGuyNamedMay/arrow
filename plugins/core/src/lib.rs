@@ -10,6 +10,20 @@
 //! the yank register is shared, so text can be copied between buffers). It uses the same
 //! `editor` and `registry` interfaces (`wit/arrow.wit`) any other plugin uses, so a
 //! plugin loaded later can replace any of these commands or bindings.
+//!
+//! How it stays fast on big buffers and with many dots:
+//!
+//! - **Undo keeps snapshots in the host** (`take-snapshot`). They share the text
+//!   with the buffer, so taking one is O(1), and `changed-since` usually
+//!   answers from a revision counter. Nothing copies the buffer into the plugin.
+//! - **Edits shift the dots in the host** (`edit`), in one call per edit
+//!   rather than fetching every dot and sending it back.
+//! - **Line boundaries come from the host's line index** (`line-start`,
+//!   `line-end`, `line-index`), not from scanning a character at a time.
+//! - **Other character-by-character scans read a local copy** of the text
+//!   around them ([`char_at`]'s window), refreshed only when the text changes.
+//! - **Merging dots sorts them once** (O(n log n)) instead of comparing each
+//!   with every other.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -52,6 +66,8 @@ impl Guest for Core {
 
     fn run_command(name: String, arg: Option<String>) {
         follow_buffer();
+        // Other plugins may have edited the text since our last command.
+        forget_window();
         let arg = arg.as_deref();
         let Some(command) = COMMANDS.iter().find(|c| c.name == name) else {
             ed::message(&format!("core has no command `{name}`"));
@@ -88,11 +104,36 @@ export!(Core);
 
 // ----- Plugin state (lives as long as the plugin instance) -----
 
-/// The editor's text and dots at one moment, for undo.
-#[derive(Clone)]
-struct Snapshot {
-    text: String,
-    dots: Vec<Selection>,
+/// The editor's text and dots at one moment, for undo, kept by the host.
+///
+/// Holding one costs almost nothing: the host shares the text with the buffer
+/// (a rope clone) and gives us an id. Dropping the value tells the host to
+/// forget the snapshot, so steps are freed as they leave the undo and redo
+/// stacks (when a new edit clears the redo stack, say).
+struct Snapshot(u32);
+
+impl Snapshot {
+    fn take() -> Self {
+        Self(ed::take_snapshot())
+    }
+
+    /// Whether the buffer's text differs from this snapshot's. The host answers
+    /// from a revision counter unless the text was edited since.
+    fn changed(&self) -> bool {
+        ed::changed_since(self.0)
+    }
+
+    /// Put the buffer back as it was. O(1): the host swaps the rope back in.
+    fn restore(&self) {
+        ed::restore_snapshot(self.0);
+        forget_window();
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        ed::drop_snapshot(self.0);
+    }
 }
 
 #[derive(Default)]
@@ -127,7 +168,19 @@ thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
     /// The dot the current per-dot command is working on.
     static DOT: Cell<u32> = const { Cell::new(0) };
+    /// Text copied from the buffer for [`char_at`].
+    static WINDOW: RefCell<Window> = const { RefCell::new(Window { start: 0, chars: Vec::new() }) };
 }
+
+/// Characters `start..start + chars.len()` of the buffer, as copied for
+/// [`char_at`]. Empty when forgotten.
+struct Window {
+    start: u32,
+    chars: Vec<char>,
+}
+
+/// How many characters [`char_at`] copies at a time.
+const WINDOW_SIZE: u32 = 4096;
 
 /// Use the current buffer's history. If another buffer became current since our
 /// last command, park the old buffer's history and pick up the new one's (a
@@ -607,32 +660,28 @@ fn execute_command(name: &str) {
 
 // ----- Editing, merging and undo: the behaviour the host leaves to us -----
 
-/// Replace `start..end` (end exclusive) with `text`, then shift every dot so it
+/// Replace `start..end` (end exclusive) with `text`, and shift every dot so it
 /// keeps pointing at the same text: dots after the change move by its size, and
 /// dot ends inside the replaced range move to its start. Keeps the final newline.
+///
+/// The host's `edit` does the replacing and the shifting in one call. Doing the
+/// shift here meant fetching every dot and sending them all back for each edit,
+/// so a command at n dots copied n lists of n dots across the wasm boundary.
 fn edit(start: u32, end: u32, text: &str) {
-    let end = end.min(ed::len());
+    let len = ed::len();
+    let end = end.min(len);
     let start = start.min(end);
-    let inserted = char_count(text);
-    ed::replace(start, end, text);
-    let shift = |pos: u32| {
-        if pos >= end {
-            pos - (end - start) + inserted
-        } else if pos >= start {
-            start
-        } else {
-            pos
-        }
-    };
-    let dots: Vec<Selection> = ed::get_dots()
-        .iter()
-        .map(|dot| Selection {
-            anchor: shift(dot.anchor),
-            cursor: shift(dot.cursor),
-        })
-        .collect();
+    // An edit that reaches the end of the text replaces the final newline. Put
+    // it back in the same edit, so a dot left at the end of the text lands on
+    // it (the host pulls dots back inside the text after each change).
+    let removes_final_newline = end == len && !(start == end && text.is_empty());
+    if removes_final_newline && !text.ends_with('\n') {
+        ed::edit(start, end, &format!("{text}\n"));
+    } else {
+        ed::edit(start, end, text);
+    }
+    forget_window();
     keep_final_newline();
-    ed::set_dots(&dots);
 }
 
 /// Like Kakoune, the buffer always ends with a newline.
@@ -640,63 +689,78 @@ fn keep_final_newline() {
     let len = ed::len();
     if len == 0 || ed::char_at(len - 1) != Some('\n') {
         ed::replace(len, len, "\n");
+        forget_window();
     }
 }
 
-/// Merge dots that overlap into the older one, keeping its direction.
+/// Merge dots that overlap (share a character) into the oldest of them, keeping
+/// its direction. The merged dots stay in their original, oldest-first order.
+///
+/// How: sort the dots by where they start, so overlapping dots end up next to
+/// each other, then make one pass that grows a group while the next dot starts
+/// inside it. That is O(n log n); comparing each dot with every kept one, as
+/// this used to, was O(n²) with many dots.
 fn merge_dots() {
-    let mut merged: Vec<Selection> = Vec::new();
-    for dot in ed::get_dots() {
-        let (start, end) = (dot.anchor.min(dot.cursor), dot.anchor.max(dot.cursor));
-        let overlapping = merged.iter_mut().find(|kept| {
-            kept.anchor.min(kept.cursor) <= end && start <= kept.anchor.max(kept.cursor)
-        });
-        match overlapping {
-            Some(kept) => {
-                let forward = kept.anchor <= kept.cursor;
-                let start = start.min(kept.anchor.min(kept.cursor));
-                let end = end.max(kept.anchor.max(kept.cursor));
-                *kept = if forward {
-                    Selection { anchor: start, cursor: end }
-                } else {
-                    Selection { anchor: end, cursor: start }
-                };
+    let dots = ed::get_dots();
+    if dots.len() < 2 {
+        return;
+    }
+    let start = |dot: &Selection| dot.anchor.min(dot.cursor);
+    let end = |dot: &Selection| dot.anchor.max(dot.cursor);
+
+    // Dot indices by start (ties by age, so groups are deterministic).
+    let mut by_start: Vec<usize> = (0..dots.len()).collect();
+    by_start.sort_by_key(|&i| (start(&dots[i]), i));
+
+    // Each group of overlapping dots as (oldest member, start, inclusive end).
+    let mut groups: Vec<(usize, u32, u32)> = Vec::with_capacity(dots.len());
+    for i in by_start {
+        let (dot_start, dot_end) = (start(&dots[i]), end(&dots[i]));
+        match groups.last_mut() {
+            Some((oldest, _, group_end)) if dot_start <= *group_end => {
+                *group_end = (*group_end).max(dot_end);
+                *oldest = (*oldest).min(i);
             }
-            None => merged.push(dot),
+            _ => groups.push((i, dot_start, dot_end)),
         }
     }
-    if merged != ed::get_dots() {
-        ed::set_dots(&merged);
+    if groups.len() == dots.len() {
+        return; // nothing overlapped
     }
-}
 
-fn snapshot() -> Snapshot {
-    Snapshot {
-        text: ed::slice(0, ed::len()),
-        dots: ed::get_dots(),
-    }
-}
-
-fn restore(snapshot: &Snapshot) {
-    ed::replace(0, ed::len(), &snapshot.text);
-    ed::set_dots(&snapshot.dots);
+    // Back into age order, each group taking its oldest member's direction.
+    groups.sort_by_key(|&(oldest, _, _)| oldest);
+    let merged: Vec<Selection> = groups
+        .iter()
+        .map(|&(oldest, start, end)| {
+            let forward = dots[oldest].anchor <= dots[oldest].cursor;
+            if forward {
+                Selection { anchor: start, cursor: end }
+            } else {
+                Selection { anchor: end, cursor: start }
+            }
+        })
+        .collect();
+    ed::set_dots(&merged);
 }
 
 /// Open an undo group before a command, unless one is already open (as it is
 /// throughout an insert session). Edits other plugins made since our last command
 /// become their own undo step first.
+///
+/// Every command does this, motions included, so it must be cheap: taking a
+/// snapshot is O(1), and `changed` compares revisions rather than text.
 fn begin_undo_group() {
-    let now = snapshot();
     STATE.with(|s| {
         let mut state = s.borrow_mut();
         if state.history.group.is_none() {
             if let Some(known) = state.history.known.take()
-                && known.text != now.text
+                && known.changed()
             {
                 state.history.undo.push(known);
                 state.history.redo.clear();
             }
-            state.history.group = Some(now);
+            state.history.group = Some(Snapshot::take());
         }
     });
 }
@@ -709,12 +773,14 @@ fn end_undo_group() {
     }
 }
 
+/// Close the open group: it becomes an undo step if the text changed since it
+/// opened. A group that changed nothing (a motion) is just dropped, which frees
+/// its snapshot in the host.
 fn close_undo_group() {
-    let text = ed::slice(0, ed::len());
     STATE.with(|s| {
         let mut state = s.borrow_mut();
         if let Some(group) = state.history.group.take()
-            && group.text != text
+            && group.changed()
         {
             state.history.undo.push(group);
             state.history.redo.clear();
@@ -722,8 +788,10 @@ fn close_undo_group() {
     });
 }
 
+/// Remember the state after our command, to notice edits other plugins make
+/// before the next one. Replacing the old `known` drops its snapshot.
 fn remember_state() {
-    let now = snapshot();
+    let now = Snapshot::take();
     STATE.with(|s| s.borrow_mut().history.known = Some(now));
 }
 
@@ -732,7 +800,7 @@ fn step_history(undo: bool) -> bool {
     // Count edits made by other plugins, and an open group, as steps first.
     begin_undo_group();
     close_undo_group();
-    let current = snapshot();
+    let current = Snapshot::take();
     let target = STATE.with(|s| {
         let state = &mut *s.borrow_mut();
         let (from, to) = if undo {
@@ -746,7 +814,7 @@ fn step_history(undo: bool) -> bool {
     });
     match target {
         Some(target) => {
-            restore(&target);
+            target.restore();
             true
         }
         None => false,
@@ -787,29 +855,49 @@ fn last() -> u32 {
     ed::len() - 1
 }
 
+/// The character at `index`, or a newline past the end of the text.
+///
+/// Word motions and similar scans call this once per character. Each call used
+/// to be a host call; now it reads a window of the text copied into the plugin
+/// (a few thousand characters around the position), fetching a new window only
+/// when a scan leaves the current one. [`forget_window`] throws it away
+/// whenever the text changes.
 fn char_at(index: u32) -> char {
-    ed::char_at(index).unwrap_or('\n')
+    WINDOW.with(|window| {
+        let mut window = window.borrow_mut();
+        let inside = index >= window.start && ((index - window.start) as usize) < window.chars.len();
+        if !inside {
+            // Most scans go forward, so start a little before `index`.
+            let start = index.saturating_sub(WINDOW_SIZE / 4);
+            window.start = start;
+            window.chars = ed::slice(start, start.saturating_add(WINDOW_SIZE)).chars().collect();
+        }
+        window
+            .chars
+            .get(index.wrapping_sub(window.start) as usize)
+            .copied()
+            .unwrap_or('\n')
+    })
+}
+
+/// Forget the copied window, because the text changed.
+fn forget_window() {
+    WINDOW.with(|window| window.borrow_mut().chars.clear());
 }
 
 fn char_count(text: &str) -> u32 {
     text.chars().count() as u32
 }
 
+/// Start of the line containing `index`, from the host's line index (O(log n),
+/// where scanning back a character at a time was O(line length)).
 fn line_start(index: u32) -> u32 {
-    let mut start = index;
-    while start > 0 && char_at(start - 1) != '\n' {
-        start -= 1;
-    }
-    start
+    ed::line_start(index)
 }
 
-/// Index of the line's newline.
+/// Index of the line's newline, also from the host's line index.
 fn line_end(index: u32) -> u32 {
-    let mut end = index;
-    while end < last() && char_at(end) != '\n' {
-        end += 1;
-    }
-    end
+    ed::line_end(index)
 }
 
 /// Last character before the newline, or the newline on an empty line.
@@ -832,9 +920,10 @@ fn line_below(index: u32, lines: u32) -> Option<u32> {
     Some(start)
 }
 
-/// Number of line breaks between two positions.
+/// Number of line breaks in `from..to`: the difference between their line
+/// numbers, which the host knows without counting.
 fn lines_between(from: u32, to: u32) -> u32 {
-    (from..to).filter(|&i| char_at(i) == '\n').count() as u32
+    ed::line_index(to).saturating_sub(ed::line_index(from))
 }
 
 fn first_non_blank(index: u32) -> u32 {

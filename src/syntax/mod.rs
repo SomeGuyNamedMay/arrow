@@ -228,6 +228,19 @@ fn parse(parser: &mut Parser, rope: &Rope, old: Option<&Tree>) -> Option<Tree> {
 
 /// Describe replacing `start..end` (char indices, end exclusive) of `rope`
 /// with `text`, for tree-sitter. Call before making the change.
+/// Describe replacing all of `old` with `new` (a restored undo step), without
+/// turning either rope into a string.
+pub fn whole_text_edit(old: &Rope, new: &Rope) -> InputEdit {
+    InputEdit {
+        start_byte: 0,
+        old_end_byte: old.len_bytes(),
+        new_end_byte: new.len_bytes(),
+        start_position: Point { row: 0, column: 0 },
+        old_end_position: point(old, old.len_bytes()),
+        new_end_position: point(new, new.len_bytes()),
+    }
+}
+
 pub fn input_edit(rope: &Rope, start: usize, end: usize, text: &str) -> InputEdit {
     let start_byte = rope.char_to_byte(start);
     let old_end_byte = rope.char_to_byte(end);

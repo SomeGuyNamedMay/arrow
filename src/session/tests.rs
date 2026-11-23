@@ -540,6 +540,43 @@ fn closing_a_buffer_shows_another_and_keeps_the_last() {
     assert_eq!(text(&app), "scratch\n");
 }
 
+// ----- Many dots and big buffers -----
+
+#[test]
+fn hundreds_of_dots_edit_merge_and_undo_together() {
+    let lines = 300;
+    let original: String = (0..lines).map(|i| format!("line {i}\n")).collect();
+    let mut app = app(&original);
+    // A dot on every line.
+    type_keys(&mut app, &"c".repeat(lines - 1));
+    assert_eq!(app.core.editor.editor().dots().len(), lines);
+
+    type_keys(&mut app, "i> <esc>");
+    let edited = text(&app);
+    assert!(edited.lines().all(|line| line.starts_with("> line ")), "{}", &edited[..60]);
+
+    // Selecting every line merges all the dots into one.
+    type_keys(&mut app, "%");
+    assert_eq!(app.core.editor.editor().dots().len(), 1);
+
+    // One undo step takes the whole insert back, at every dot.
+    type_keys(&mut app, "u");
+    assert_eq!(text(&app), original);
+}
+
+#[test]
+fn undo_on_a_large_buffer_restores_it_exactly() {
+    let original: String = (0..20_000).map(|i| format!("{i:>8} some text on this line\n")).collect();
+    let mut app = app(&original);
+    type_keys(&mut app, "geidone<esc>xd");
+    assert_ne!(text(&app), original);
+    // Motions don't make undo steps; the two edits are one each.
+    type_keys(&mut app, "jjkkuu");
+    assert_eq!(text(&app), original);
+    type_keys(&mut app, "U");
+    assert!(text(&app).ends_with("done\n"));
+}
+
 // ----- The terminal (owned by the window; the session only asks for it) -----
 
 fn keys(keys: &str) -> Vec<KeyPress> {

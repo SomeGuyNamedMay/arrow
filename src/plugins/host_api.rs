@@ -107,6 +107,41 @@ impl host_editor::Host for HostState {
             .replace(start as usize, end as usize, &text);
     }
 
+    fn edit(&mut self, start: u32, end: u32, text: String) {
+        self.core()
+            .editor
+            .editor_mut()
+            .replace_shifting(start as usize, end as usize, &text);
+    }
+
+    fn line_start(&mut self, index: u32) -> u32 {
+        self.core().editor.editor().line_start_of(index as usize) as u32
+    }
+
+    fn line_end(&mut self, index: u32) -> u32 {
+        self.core().editor.editor().line_end_of(index as usize) as u32
+    }
+
+    fn line_index(&mut self, index: u32) -> u32 {
+        self.core().editor.editor().line_index(index as usize) as u32
+    }
+
+    fn take_snapshot(&mut self) -> u32 {
+        self.core().take_snapshot()
+    }
+
+    fn restore_snapshot(&mut self, id: u32) -> bool {
+        self.core().restore_snapshot(id)
+    }
+
+    fn changed_since(&mut self, id: u32) -> bool {
+        self.core().changed_since(id)
+    }
+
+    fn drop_snapshot(&mut self, id: u32) {
+        self.core().drop_snapshot(id);
+    }
+
     fn open_buffer(&mut self, name: String, text: String) -> u32 {
         self.core().open_buffer(&name, &text)
     }

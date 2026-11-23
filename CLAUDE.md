@@ -45,6 +45,7 @@ src/
   plugins/host_api.rs    host implementations of the WIT interfaces
   plugins/registry.rs    modes, commands, key bindings, subscriptions
   plugins/buffers.rs     multiple buffers on Core (open/switch/close/list)
+  plugins/snapshots.rs   undo snapshots on Core (rope clones, by id)
   syntax/                tree-sitter: config.rs (languages.toml, theme),
                          highlight.rs (colours for visible text), mod.rs (parsing)
   components/            widgets: text_editor/ (Editor storage + view),
@@ -62,6 +63,17 @@ tests/fixtures/          demo tree-sitter grammar + config used by syntax tests
   merge them or keep the final newline. The core plugin does that (its `edit`
   shifts every dot). The host's one rule is that dots stay inside the text and
   there is always at least one. Behaviour belongs in a plugin, not in the host.
+  - **Exception: mechanical helpers for speed.** These are things that would
+    be slow across the wasm boundary. Plugins still decide when to use them:
+    - `edit` replaces text and shifts dots by core's rule
+      (`Editor::replace_shifting`);
+    - `line-start`, `line-end` and `line-index` use the rope's line index;
+    - undo snapshots (`src/plugins/snapshots.rs`) are rope clones with a
+      revision counter.
+  - **Keep the core plugin off the slow paths.** Never copy the whole buffer
+    into it (`slice(0, len)`) and never loop over `char-at`. Use the helpers,
+    or core's `char_at` window, which must be cleared (`forget_window`) after
+    any change to the text.
 - **Positions are character indices**, not bytes. A dot is a selection
   `min(anchor, cursor)..=max(anchor, cursor)`. The last dot is the primary one.
   Tree-sitter uses bytes, so `syntax::input_edit` converts between the two.

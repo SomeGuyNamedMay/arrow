@@ -21,10 +21,11 @@
 //! - this module: loading plugins, and lending them the [`Core`] for each call.
 
 mod buffers;
+mod snapshots;
 mod host_api;
 mod registry;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -39,6 +40,7 @@ use crate::components::tree_menu::{TreeNode, TreeSpec};
 use crate::config::user_config_dir;
 use host_api::HostState;
 pub use buffers::{Buffer, BufferId};
+use snapshots::{Snapshot, SnapshotId};
 pub use registry::{Lookup, Registry};
 
 wasmtime::component::bindgen!({
@@ -142,6 +144,9 @@ pub struct Core {
     hidden: Vec<Buffer>,
     /// The highest buffer id handed out so far, so ids are never reused.
     last_buffer_id: BufferId,
+    /// Undo snapshots plugins have taken, by id (see `snapshots`).
+    snapshots: HashMap<SnapshotId, Snapshot>,
+    last_snapshot_id: SnapshotId,
     pub registry: Registry,
     /// Events waiting to be delivered.
     pub events: VecDeque<Event>,
@@ -213,6 +218,16 @@ struct LoadedPlugin {
 pub struct PluginHost {
     linker: Linker<HostState>,
     plugins: Vec<LoadedPlugin>,
+    /// What the caller's `Core` holds while the real one is lent to a plugin.
+    ///
+    /// Lending moves the `Core` into the plugin's store, and something has to
+    /// stay behind in its place. `mem::take` would build a fresh
+    /// `Core::default()` for that on every call (an empty text editor: a rope,
+    /// a dots vector and a couple of strings), and a key press makes several
+    /// calls. Instead one stand-in is built on first use and handed back and
+    /// forth, so lending allocates nothing. Nobody reads it: the session waits
+    /// for the call to finish.
+    stand_in: Option<Core>,
 }
 
 impl PluginHost {
@@ -224,6 +239,7 @@ impl PluginHost {
         Self {
             linker,
             plugins: Vec::new(),
+            stand_in: None,
         }
     }
 
@@ -354,8 +370,10 @@ impl PluginHost {
                 plugin.name
             ));
         }
+        // Swap the real core out for the stand-in (built once, the first time).
+        let stand_in = self.stand_in.take().unwrap_or_default();
         let state = plugin.store.data_mut();
-        state.core = Some(std::mem::take(core));
+        state.core = Some(std::mem::replace(core, stand_in));
         state.ticks_left = match call {
             Call::Init => INIT_TICKS,
             Call::Command(..) | Call::Event(_) => CALL_TICKS,
@@ -367,12 +385,14 @@ impl PluginHost {
             Call::Command(name, arg) => bindings.call_run_command(store, name, arg).await,
             Call::Event(event) => bindings.call_on_event(store, event).await,
         };
-        *core = plugin
+        // Swap it back, and keep the stand-in for next time.
+        let lent = plugin
             .store
             .data_mut()
             .core
             .take()
             .expect("the core is returned after every call");
+        self.stand_in = Some(std::mem::replace(core, lent));
         result.map_err(|e| {
             plugin.failed = true;
             format!("plugin `{}` failed and was disabled: {e:#}", plugin.name)

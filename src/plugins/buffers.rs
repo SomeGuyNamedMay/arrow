@@ -87,6 +87,7 @@ impl Core {
             .position(|b| b.id == id)
             .ok_or_else(|| format!("no buffer {id}"))?;
         self.hidden.remove(position);
+        self.drop_snapshots_of(id);
         Ok(())
     }
 
