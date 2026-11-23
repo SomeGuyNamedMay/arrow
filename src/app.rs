@@ -1,4 +1,5 @@
-//! The window: hands key presses to the session, asynchronously.
+//! The window: hands key presses to the session, asynchronously, and owns the
+//! terminal panel under the status bar.
 
 use std::collections::VecDeque;
 
@@ -9,7 +10,9 @@ use crate::components::keys::{self, KeyPress};
 use crate::components::menu::Menu;
 use crate::components::text_editor::TextEditor;
 use crate::components::tree_menu::TreeMenu;
-use crate::session::Session;
+use crate::config::user_config_dir;
+use crate::session::{Session, TerminalRequest};
+use crate::terminal::{self, Panel, Started, TerminalConfig};
 
 /// Shown while plugins load, and the scratch buffer's text afterwards.
 const WELCOME: &str = "\
@@ -43,21 +46,29 @@ pub struct App {
     session: Option<Box<Session>>,
     /// What the session looked like when it left, drawn until it returns.
     frame: Frame,
-    /// Keys pressed while the session was busy.
+    /// Keys waiting their turn: for the session while it is busy, or for the
+    /// terminal once a batch has handed it the keys.
     inbox: VecDeque<KeyPress>,
+    /// The terminal under the status bar. It lives here rather than in the
+    /// session so it keeps running, and drawing, while plugins work.
+    terminal: Panel,
 }
 
 pub enum Message {
     Key(KeyPress),
-    /// A task finished with the session.
-    Done(Box<Session>),
+    /// A task finished with the session, with the key presses it left
+    /// unhandled (those after a `terminal` command).
+    Done(Box<Session>, Vec<KeyPress>),
+    /// Something the shell with this generation reported.
+    Terminal(u64, terminal::Event),
 }
 
 impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Message::Key(press) => f.debug_tuple("Key").field(press).finish(),
-            Message::Done(_) => f.write_str("Done"),
+            Message::Done(_, rest) => f.debug_tuple("Done").field(rest).finish(),
+            Message::Terminal(generation, _) => f.debug_tuple("Terminal").field(generation).finish(),
         }
     }
 }
@@ -83,6 +94,14 @@ impl Frame {
 impl App {
     /// Start with the welcome text on screen while plugins load in the background.
     pub fn new() -> (Self, Task<Message>) {
+        let mut startup_error = None;
+        let terminal_config = match user_config_dir() {
+            Some(dir) => TerminalConfig::load(&dir).unwrap_or_else(|error| {
+                startup_error = Some(error);
+                TerminalConfig::default()
+            }),
+            None => TerminalConfig::default(),
+        };
         let app = Self {
             session: None,
             frame: Frame {
@@ -91,24 +110,59 @@ impl App {
                 tree: TreeMenu::new(),
             },
             inbox: VecDeque::new(),
+            terminal: Panel::new(terminal_config),
         };
-        let start = Task::perform(Session::start(WELCOME, true), |session| {
-            Message::Done(Box::new(session))
+        let start = Task::perform(Session::start(WELCOME, true), move |mut session| {
+            if let Some(error) = &startup_error {
+                session.core.editor.editor_mut().set_message(error.clone());
+            }
+            Message::Done(Box::new(session), Vec::new())
         });
         (app, start)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let mut tasks = Vec::new();
         match message {
             Message::Key(press) => self.inbox.push_back(press),
-            Message::Done(session) => {
+            Message::Done(mut session, rest) => {
                 if session.quit {
                     return iced::exit();
                 }
+                let request = session.terminal_request.take();
                 self.session = Some(session);
+                // Keys after the request come next, before any typed since.
+                for press in rest.into_iter().rev() {
+                    self.inbox.push_front(press);
+                }
+                let started = match request {
+                    Some(TerminalRequest::Focus) => self.terminal.focus(),
+                    Some(TerminalRequest::Toggle) => self.terminal.toggle(),
+                    None => None,
+                };
+                tasks.push(stream(started));
             }
+            Message::Terminal(generation, event) => self.terminal.handle(generation, event),
         }
-        self.dispatch()
+        tasks.push(self.pump());
+        self.terminal.sync_size();
+        Task::batch(tasks)
+    }
+
+    /// Hand waiting keys to whoever has them: the terminal, one by one, while
+    /// it has focus, then the session, as a batch.
+    fn pump(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        while self.terminal.focused() {
+            let Some(press) = self.inbox.pop_front() else {
+                break;
+            };
+            tasks.push(stream(self.terminal.press(press)));
+        }
+        if !self.terminal.focused() {
+            tasks.push(self.dispatch());
+        }
+        Task::batch(tasks)
     }
 
     /// If the session is free and keys are waiting, send them all to it.
@@ -124,22 +178,21 @@ impl App {
         let presses: Vec<KeyPress> = self.inbox.drain(..).collect();
         Task::perform(
             async move {
-                for press in presses {
-                    session.press(press).await;
-                    if session.quit {
-                        break;
-                    }
-                }
-                session
+                let rest = session.press_all(presses).await;
+                (session, rest)
             },
-            Message::Done,
+            |(session, rest)| Message::Done(session, rest),
         )
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        match &self.session {
+        let main = match &self.session {
             Some(session) => view(&session.core.editor, &session.menu, &session.tree),
             None => view(&self.frame.editor, &self.frame.menu, &self.frame.tree),
+        };
+        match self.terminal.view() {
+            Some(terminal) => column![main, terminal].into(),
+            None => main,
         }
     }
 
@@ -155,6 +208,16 @@ fn view<'a>(editor: &'a TextEditor, menu: &'a Menu, tree: &'a TreeMenu) -> Eleme
         column![editor.view(), tree.view()].into()
     } else {
         editor.view()
+    }
+}
+
+/// Turn a newly started shell's events into messages, for as long as it runs.
+fn stream(started: Started) -> Task<Message> {
+    match started {
+        Some((generation, events)) => {
+            Task::run(events, move |event| Message::Terminal(generation, event))
+        }
+        None => Task::none(),
     }
 }
 
@@ -184,6 +247,7 @@ mod tests {
             frame: Frame::of(&session),
             session: Some(Box::new(session)),
             inbox: VecDeque::new(),
+            terminal: Panel::new(TerminalConfig::default()),
         };
         // The first key sends the session off in a task; the view falls back to
         // the frame it left behind.

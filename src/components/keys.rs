@@ -20,6 +20,8 @@ pub enum EditorKey {
     Down,
     Home,
     End,
+    PageUp,
+    PageDown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +91,8 @@ impl fmt::Display for KeyChord {
             EditorKey::Down => "down".to_string(),
             EditorKey::Home => "home".to_string(),
             EditorKey::End => "end".to_string(),
+            EditorKey::PageUp => "pageup".to_string(),
+            EditorKey::PageDown => "pagedown".to_string(),
         };
         let plain = matches!(self.key, EditorKey::Char(c) if !matches!(c, '<' | '>' | ' '))
             && !self.alt
@@ -162,6 +166,8 @@ fn parse_named(name: &str) -> Result<KeyChord, String> {
         "down" => EditorKey::Down,
         "home" => EditorKey::Home,
         "end" => EditorKey::End,
+        "pageup" => EditorKey::PageUp,
+        "pagedown" => EditorKey::PageDown,
         "lt" => EditorKey::Char('<'),
         "gt" => EditorKey::Char('>'),
         "space" => EditorKey::Char(' '),
@@ -221,6 +227,8 @@ pub fn from_event(event: keyboard::Event) -> Option<KeyPress> {
         Key::Named(Named::ArrowDown) => EditorKey::Down,
         Key::Named(Named::Home) => EditorKey::Home,
         Key::Named(Named::End) => EditorKey::End,
+        Key::Named(Named::PageUp) => EditorKey::PageUp,
+        Key::Named(Named::PageDown) => EditorKey::PageDown,
         _ => return None,
     };
     Some(KeyPress {

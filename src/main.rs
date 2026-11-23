@@ -7,6 +7,7 @@
 //! - [`plugins`]: loads and calls WebAssembly plugins, and the API they use.
 //! - [`syntax`]: tree-sitter highlighting with grammars the user adds.
 //! - [`components`]: the widgets: text editor, menu and tree menu.
+//! - [`terminal`]: the scratchpad terminal under the status bar.
 //! - [`config`]: where the user's plugins, grammars and settings live.
 
 mod app;
@@ -15,6 +16,7 @@ mod config;
 mod plugins;
 mod session;
 mod syntax;
+mod terminal;
 
 use app::App;
 

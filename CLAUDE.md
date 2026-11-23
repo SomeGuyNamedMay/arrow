@@ -36,6 +36,9 @@ src/
   app.rs                 iced window: key inbox, Frame snapshot, async dispatch
   session/mod.rs         Session: key → command → events → follow-ups → syntax
   session/write.rs       saving a buffer to its file (the `write` app command)
+  terminal/              scratchpad terminal: mod.rs (pty, shell, screen,
+                         transcript), panel.rs (show/hide/focus, owned by App),
+                         keys.rs (keys → xterm bytes), view.rs, config.rs
   session/tests.rs       end-to-end tests through the bundled plugins
   config.rs              user config dir (%APPDATA%\arrow, ~/.config/arrow)
   plugins/mod.rs         loading/calling plugins, Core (state lent to plugins)
@@ -99,6 +102,24 @@ tests/fixtures/          demo tree-sitter grammar + config used by syntax tests
   edit doesn't count. The `[+]` in the status bar, `buffer-info.modified`, and
   the files plugin's refusal to close a modified buffer (`discard-buffer`
   forces it) all come from this.
+- **The terminal belongs to `App`, not `Session`.**
+  - **Why:** it keeps running and drawing while a task holds the session.
+  - **Shell:** `portable-pty` (ConPTY on Windows) runs it, and `vt100` keeps the
+    screen. Two threads report output and exit as `terminal::Event`s, which
+    `Task::run` turns into `Message::Terminal(generation, _)`. Events from a
+    replaced shell (an older generation) are ignored.
+  - **Commands:** `terminal` and `terminal-toggle` are app commands. They only
+    set `Session::terminal_request`. `Session::press_all` stops the batch
+    there and returns the remaining keys, and `App` gives them to the terminal.
+  - **Keys:** while the terminal has focus, `App::pump` sends keys straight to
+    `Panel::press`. Ctrl-t (back to the editor) and Alt-t (hide) are the only
+    keys the shell never sees.
+  - **Cursor queries:** ConPTY asks where the cursor is while PowerShell
+    starts, and waits for the answer. `Replies` in `terminal/mod.rs` answers.
+    Don't remove it.
+  - **Transcript:** raw output is appended to `<config>/state/terminal.log`.
+    On the next start its tail (256 KiB, cut at a line) is replayed before the
+    new shell's output.
 - **Plugin sandboxing:** plugins get stdout and stderr only. The files plugin
   is the exception, with read-only access to the working directory
   (`Access::ReadWorkingDir`). User plugins (`<config>/plugins/*.wasm`) always

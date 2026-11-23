@@ -25,7 +25,19 @@ mod write;
 const APP_COMMANDS: &[(&str, &str)] = &[
     ("quit", "Close Arrow"),
     ("write", "Save the buffer to its file (or to the path given)"),
+    ("terminal", "Show the terminal and type into it"),
+    ("terminal-toggle", "Show or hide the terminal"),
 ];
+
+/// What the window should do with the terminal, which it owns. Set by the
+/// `terminal` commands, and taken by the window when the session comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRequest {
+    /// Show it (starting a shell if there isn't one) and give it the keys.
+    Focus,
+    /// Hide it if it's showing, otherwise show and focus it.
+    Toggle,
+}
 
 /// Most events and queued commands handled after one action, so plugins that keep
 /// triggering each other can't hang the editor.
@@ -47,6 +59,8 @@ pub struct Session {
     awaiting_char: Option<String>,
     /// The `quit` command ran: close the window.
     pub(crate) quit: bool,
+    /// A `terminal` command ran; the window acts on it.
+    pub(crate) terminal_request: Option<TerminalRequest>,
     /// Parses the buffer for highlighting. `None` if tree-sitter couldn't start.
     syntax: Option<Syntax>,
 }
@@ -89,6 +103,7 @@ impl Session {
             pending_keys: Vec::new(),
             awaiting_char: None,
             quit: false,
+            terminal_request: None,
             syntax,
         };
         session.core.events.push_back(Event::Startup);
@@ -102,6 +117,20 @@ impl Session {
             session.report(error);
         }
         session
+    }
+
+    /// Handle key presses in order until one asks the window to do something
+    /// (quit, or show the terminal). Returns the presses not handled, which now
+    /// belong to the window: keys typed after Ctrl-t go to the terminal.
+    pub async fn press_all(&mut self, presses: Vec<KeyPress>) -> Vec<KeyPress> {
+        let mut presses = presses.into_iter();
+        for press in presses.by_ref() {
+            self.press(press).await;
+            if self.quit || self.terminal_request.is_some() {
+                break;
+            }
+        }
+        presses.collect()
     }
 
     /// Handle a key press, then deliver the events it caused and any commands
@@ -232,6 +261,8 @@ impl Session {
     async fn run_command(&mut self, name: &str, arg: Option<String>) {
         match name {
             "quit" => self.quit = true,
+            "terminal" => self.terminal_request = Some(TerminalRequest::Focus),
+            "terminal-toggle" => self.terminal_request = Some(TerminalRequest::Toggle),
             "write" => {
                 let editor = self.core.editor.editor_mut();
                 match write::write_buffer(editor, arg.as_deref()) {

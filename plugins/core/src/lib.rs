@@ -483,8 +483,11 @@ const NORMAL_BINDINGS: &[(&str, &str)] = &[
     ("<lt>", "dedent"),
     ("u", "undo"),
     ("U", "redo"),
-    // The host's own command: plugins can bind it, but only the host writes.
+    // The host's own commands: plugins can bind them, but only the host writes
+    // files or runs the terminal.
     ("<c-s>", "write"),
+    ("<c-t>", "terminal"),
+    ("<a-t>", "terminal-toggle"),
 ];
 
 const INSERT_BINDINGS: &[(&str, &str)] = &[
@@ -500,6 +503,8 @@ const INSERT_BINDINGS: &[(&str, &str)] = &[
     ("<home>", "goto-line-start"),
     ("<end>", "goto-line-newline"),
     ("<c-s>", "write"),
+    ("<c-t>", "terminal"),
+    ("<a-t>", "terminal-toggle"),
 ];
 
 const INDENT: &str = "    ";

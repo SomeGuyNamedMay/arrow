@@ -540,6 +540,40 @@ fn closing_a_buffer_shows_another_and_keeps_the_last() {
     assert_eq!(text(&app), "scratch\n");
 }
 
+// ----- The terminal (owned by the window; the session only asks for it) -----
+
+fn keys(keys: &str) -> Vec<KeyPress> {
+    keys::parse_keys(keys)
+        .unwrap()
+        .into_iter()
+        .map(|chord| KeyPress {
+            key: chord.key,
+            alt: chord.alt,
+            ctrl: chord.ctrl,
+            shift: chord.shift,
+        })
+        .collect()
+}
+
+#[test]
+fn keys_after_a_terminal_request_are_handed_back_to_the_window() {
+    let mut app = app("");
+    // Ctrl-t works in insert mode too; what follows it is for the shell.
+    let rest = block_on(app.press_all(keys("iab<c-t>ls<ret>")));
+    assert_eq!(rest, keys("ls<ret>"));
+    assert_eq!(app.terminal_request, Some(TerminalRequest::Focus));
+    assert_eq!(text(&app), "ab\n");
+
+    app.terminal_request = None;
+    let rest = block_on(app.press_all(keys("<esc><a-t>x")));
+    assert_eq!(rest, keys("x"));
+    assert_eq!(app.terminal_request, Some(TerminalRequest::Toggle));
+
+    // Without a request every key is handled.
+    app.terminal_request = None;
+    assert!(block_on(app.press_all(keys("hl"))).is_empty());
+}
+
 // ----- Writing -----
 
 /// An empty directory for one test's files, inside the working directory (the

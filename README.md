@@ -55,6 +55,8 @@ first, then act, and every command acts at every dot at once.
 | `Space b` | switch between open buffers |
 | `Ctrl-s` or `:write` | save the buffer to its file |
 | `Space k` | close the current buffer (refused if it has unsaved changes; `:discard-buffer` closes it anyway) |
+| `Ctrl-t` | open the terminal and type into it (in the terminal: back to the editor) |
+| `Alt-t` | show or hide the terminal |
 | `Alt-s`, `Space d`, `Space c` | sort lines, duplicate line, count words (from the text-tools plugin) |
 
 Opening a file gives it a buffer of its own. Opening it again switches back to
@@ -67,6 +69,20 @@ clears the mark. Saving writes to a temporary file that then replaces the
 original, so a failed save never leaves half a file. Only files inside the
 folder Arrow was started in can be written.
 
+### The terminal
+
+`Ctrl-t` opens a terminal under the status bar, running your shell in the
+folder Arrow was started in. It's a real terminal, so prompts, colours, line
+editing and full-screen programs work. While it has the keys, everything goes
+to the shell except two: `Ctrl-t` goes back to the editor with the terminal
+still showing, and `Alt-t` hides it. `Shift-PageUp` and `Shift-PageDown`
+scroll back through its history.
+
+Hiding the terminal doesn't stop the shell: its output, directory and history
+are all there when you bring it back. Its output is also saved, so when you
+next start Arrow the terminal opens with the previous session's history above
+a fresh shell. If the shell exits, any key starts a new one.
+
 ## Configuration
 
 Arrow reads your setup from `%APPDATA%\arrow` on Windows, or
@@ -78,6 +94,16 @@ arrow/
   languages.toml                    which grammar to use for which files
   grammars/<grammar>.wasm           tree-sitter grammars
   queries/<language>/highlights.scm highlight queries
+  terminal.toml                     the terminal's shell and height
+  state/terminal.log                the terminal's saved history (kept by Arrow)
+```
+
+`terminal.toml` is optional:
+
+```toml
+shell = "pwsh.exe"   # default: powershell.exe on Windows, $SHELL elsewhere
+args = ["-NoLogo"]
+rows = 12            # height in lines
 ```
 
 ### Syntax highlighting
