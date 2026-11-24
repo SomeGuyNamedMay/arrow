@@ -46,6 +46,9 @@ src/
   plugins/registry.rs    modes, commands, key bindings, subscriptions
   plugins/buffers.rs     multiple buffers on Core (open/switch/close/list)
   plugins/snapshots.rs   undo snapshots on Core (rope clones, by id)
+  plugins/compile_cache.rs  compiled plugins saved between runs
+  plugins/processes.rs   programs plugins run (`process` interface),
+                         `Programs` permissions, `plugins.toml`
   syntax/                tree-sitter: config.rs (languages.toml, theme),
                          highlight.rs (colours for visible text), mod.rs (parsing)
   components/            widgets: text_editor/ (Editor storage + view),
@@ -54,6 +57,7 @@ plugins/
   core/                  modes, motions, editing, dot shifting, merging, undo
   text-tools/            sort-lines, duplicate-line, count-words, event hooks
   files/                 ranger-style file manager, buffer list and switching
+  git/                   `git status` menu: the example user of the process API
 tests/fixtures/          demo tree-sitter grammar + config used by syntax tests
 ```
 
@@ -132,10 +136,49 @@ tests/fixtures/          demo tree-sitter grammar + config used by syntax tests
   - **Transcript:** raw output is appended to `<config>/state/terminal.log`.
     On the next start its tail (256 KiB, cut at a line) is replayed before the
     new shell's output.
-- **Plugin sandboxing:** plugins get stdout and stderr only. The files plugin
-  is the exception, with read-only access to the working directory
-  (`Access::ReadWorkingDir`). User plugins (`<config>/plugins/*.wasm`) always
-  get `Access::None`.
+- **Startup is plugin compilation, so it is cached.**
+  - **The cache:** compiled plugins (bundled and user) are saved in
+    `<cache>/plugins/<hash>.cwasm`, where `<cache>` is `config::user_cache_dir`
+    (`%LOCALAPPDATA%\arrow\cache`). The hash covers the plugin's bytes and
+    wasmtime's engine compatibility hash, so any change just misses.
+  - **Loading:** a stale or damaged entry is compiled again. Tests pass no
+    cache (`Session::start(_, false)`), so they never touch the user's folder.
+  - **Debug builds:** `Cargo.toml` sets `opt-level = 3` for the Cranelift and
+    wasmtime compiler crates, because unoptimised Cranelift made debug startup
+    take seconds.
+  - **Numbers:** startup in debug was 2.7 s; it is now 0.3 s on a first
+    launch and under 20 ms afterwards.
+  - **Changing engine settings** in `plugins::engine` is fine: the
+    compatibility hash changes, so old entries miss.
+  - **Shown while loading:** "loading plugins…" in the status bar until the
+    session arrives. Keys typed meanwhile wait in `App::inbox`.
+- **Plugin sandboxing:**
+  - **Default:** plugins get stdout and stderr only.
+  - **`Access` widens it:**
+    - `read_working_dir` gives read-only access to the working directory (the
+      files plugin).
+    - `programs` lists what a plugin may run through the `process` interface.
+  - **Bundled plugins** get theirs from `BUNDLED` in `src/plugins/mod.rs`. The
+    git plugin may run `git`.
+  - **User plugins** (`<config>/plugins/*.wasm`) never read files, and run only
+    what `<config>/plugins.toml` lists for them. A bare name there allows only
+    that bare name, resolved on the PATH; a path allows only that exact path.
+- **Programs plugins run** (`src/plugins/processes.rs`):
+  - **Threads:** each program has stdout and stderr reader threads, a
+    supervisor that sends `Exited` after both readers finish, and a stdin
+    writer thread, so `write` never blocks.
+  - **Delivery:** events go to `Session::process_events`. `App` takes that
+    receiver once, streams it as `Message::Process`, keeps a batch in
+    `App::outputs`, and hands it to `Session::deliver` with the next batch
+    (even while the terminal has the keys).
+  - **`deliver`** sends each event only to the owning plugin, with no
+    subscription needed. It wraps each in `observe`/`emit_changes`, so the
+    owner's edits cause events, as a command's would.
+  - **Cleanup:** an exited program is removed from the registry. Dropping a
+    `Process` kills it. A plugin disabled after an error has its programs
+    stopped.
+  - **Limits:** at most 16 programs per plugin. On Windows they start with
+    `CREATE_NO_WINDOW`, so no console window flashes up.
 
 ## Common changes
 
@@ -149,7 +192,9 @@ tests/fixtures/          demo tree-sitter grammar + config used by syntax tests
 **Adding a bundled plugin:** create `plugins/<name>/` as a `cdylib` crate using
 `wit-bindgen` with `path: "../../wit"`. Add it to the workspace `members` in
 `Cargo.toml`, to `BUNDLED` in `build.rs`, and to `BUNDLED` in
-`src/plugins/mod.rs` with its `Access`. Load order matters: core comes first.
+`src/plugins/mod.rs` as `(name, bytes, reads working dir, programs it may
+run)`. Load order matters: core comes first. A new event variant in the WIT
+breaks any plugin whose `on_event` matches every case, so give those a `_` arm.
 
 **Writing tests:**
 - Session tests (`src/session/tests.rs`): `app(text)` starts a session with the

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = [".", "plugins/core", "plugins/text-tools", "plugins/files"]
+members = [".", "plugins/core", "plugins/text-tools", "plugins/files", "plugins/git"]
 # Plugins target wasm32-wasip2 and are built by build.rs, so plain `cargo build`
 # and `cargo test` only cover the editor itself.
 default-members = ["."]
@@ -24,3 +24,32 @@ wasmtime-wasi = "50.0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt"] }
+
+# Plugins are compiled to machine code at runtime by wasmtime's Cranelift
+# compiler (on a first launch, or when a plugin changes; see
+# src/plugins/compile_cache.rs). Unoptimised, Cranelift is several times
+# slower, which made debug builds slow to start. So the compiler crates are
+# optimised even in debug builds; Arrow's own code stays a fast-to-build debug
+# build. This costs a little extra time on a clean build only.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-assembler-x64]
+opt-level = 3
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+[profile.dev.package.cranelift-bitset]
+opt-level = 3
+[profile.dev.package.cranelift-control]
+opt-level = 3
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3

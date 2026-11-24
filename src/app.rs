@@ -11,6 +11,7 @@ use crate::components::menu::Menu;
 use crate::components::text_editor::TextEditor;
 use crate::components::tree_menu::TreeMenu;
 use crate::config::user_config_dir;
+use crate::plugins::ProcessEvent;
 use crate::session::{Session, TerminalRequest};
 use crate::terminal::{self, Panel, Started, TerminalConfig};
 
@@ -49,6 +50,9 @@ pub struct App {
     /// Keys waiting their turn: for the session while it is busy, or for the
     /// terminal once a batch has handed it the keys.
     inbox: VecDeque<KeyPress>,
+    /// Output from programs plugins started, waiting for the session to be
+    /// free. Delivered in a batch, whoever has the keys.
+    outputs: Vec<ProcessEvent>,
     /// The terminal under the status bar. It lives here rather than in the
     /// session so it keeps running, and drawing, while plugins work.
     terminal: Panel,
@@ -61,6 +65,8 @@ pub enum Message {
     Done(Box<Session>, Vec<KeyPress>),
     /// Something the shell with this generation reported.
     Terminal(u64, terminal::Event),
+    /// A program a plugin started wrote something, or exited.
+    Process(ProcessEvent),
 }
 
 impl std::fmt::Debug for Message {
@@ -69,6 +75,7 @@ impl std::fmt::Debug for Message {
             Message::Key(press) => f.debug_tuple("Key").field(press).finish(),
             Message::Done(_, rest) => f.debug_tuple("Done").field(rest).finish(),
             Message::Terminal(generation, _) => f.debug_tuple("Terminal").field(generation).finish(),
+            Message::Process(event) => f.debug_tuple("Process").field(&event.id()).finish(),
         }
     }
 }
@@ -102,14 +109,19 @@ impl App {
             }),
             None => TerminalConfig::default(),
         };
+        // Until the session arrives, keys wait in the inbox. Say so, so the
+        // editor doesn't look like it's ignoring them.
+        let mut editor = TextEditor::new(WELCOME);
+        editor.editor_mut().set_message("loading plugins…".to_string());
         let app = Self {
             session: None,
             frame: Frame {
-                editor: TextEditor::new(WELCOME),
+                editor,
                 menu: Menu::new(),
                 tree: TreeMenu::new(),
             },
             inbox: VecDeque::new(),
+            outputs: Vec::new(),
             terminal: Panel::new(terminal_config),
         };
         let start = Task::perform(Session::start(WELCOME, true), move |mut session| {
@@ -130,6 +142,10 @@ impl App {
                     return iced::exit();
                 }
                 let request = session.terminal_request.take();
+                // The first time: stream programs' output in as messages.
+                if let Some(events) = session.process_events.take() {
+                    tasks.push(Task::run(events, Message::Process));
+                }
                 self.session = Some(session);
                 // Keys after the request come next, before any typed since.
                 for press in rest.into_iter().rev() {
@@ -143,6 +159,7 @@ impl App {
                 tasks.push(stream(started));
             }
             Message::Terminal(generation, event) => self.terminal.handle(generation, event),
+            Message::Process(event) => self.outputs.push(event),
         }
         tasks.push(self.pump());
         self.terminal.sync_size();
@@ -159,25 +176,32 @@ impl App {
             };
             tasks.push(stream(self.terminal.press(press)));
         }
-        if !self.terminal.focused() {
-            tasks.push(self.dispatch());
-        }
+        // Programs' output goes to the session even while the terminal has
+        // the keys; the keys themselves only when it doesn't.
+        let keys = !self.terminal.focused();
+        tasks.push(self.dispatch(keys));
         Task::batch(tasks)
     }
 
-    /// If the session is free and keys are waiting, send them all to it.
-    fn dispatch(&mut self) -> Task<Message> {
-        if self.inbox.is_empty() {
+    /// If the session is free and something is waiting for it (programs'
+    /// output, and keys if `keys`), send it all in one task.
+    fn dispatch(&mut self, keys: bool) -> Task<Message> {
+        let presses_waiting = keys && !self.inbox.is_empty();
+        if !presses_waiting && self.outputs.is_empty() {
             return Task::none();
         }
         let Some(mut session) = self.session.take() else {
-            // Busy: the keys go with the next batch.
+            // Busy: they go with the next batch.
             return Task::none();
         };
         self.frame = Frame::of(&session);
-        let presses: Vec<KeyPress> = self.inbox.drain(..).collect();
+        let outputs = std::mem::take(&mut self.outputs);
+        let presses: Vec<KeyPress> = if keys { self.inbox.drain(..).collect() } else { Vec::new() };
         Task::perform(
             async move {
+                if !outputs.is_empty() {
+                    session.deliver(outputs).await;
+                }
                 let rest = session.press_all(presses).await;
                 (session, rest)
             },
@@ -247,6 +271,7 @@ mod tests {
             frame: Frame::of(&session),
             session: Some(Box::new(session)),
             inbox: VecDeque::new(),
+            outputs: Vec::new(),
             terminal: Panel::new(TerminalConfig::default()),
         };
         // The first key sends the session off in a task; the view falls back to

@@ -1,4 +1,4 @@
-package arrow:plugin@0.9.0;
+package arrow:plugin@0.10.0;
 
 interface types {
     record selection {
@@ -28,6 +28,30 @@ interface types {
         selection-changed(selection),
         mode-changed(string),
         command-executed(string),
+        /// A program this plugin started (see the `process` interface) wrote
+        /// something. Sent only to that plugin, which needn't subscribe. Edits
+        /// made while handling it do trigger events, as a command's would.
+        process-output(process-output),
+        /// A program this plugin started has exited. Sent after all its output.
+        process-exited(process-exit),
+    }
+
+    enum output-stream { stdout, stderr }
+
+    record process-output {
+        /// The id `spawn` returned.
+        id: u32,
+        %stream: output-stream,
+        /// Bytes as the program wrote them, in chunks of any size. Text can be
+        /// split mid-line, or mid-character in UTF-8, between chunks.
+        data: list<u8>,
+    }
+
+    record process-exit {
+        id: u32,
+        /// The exit code, or none if the program was killed or its status
+        /// couldn't be read.
+        code: option<s32>,
     }
 
     /// One entry in a menu.
@@ -256,6 +280,45 @@ interface registry {
     list-bindings: func() -> list<binding-info>;
 }
 
+/// Running other programs and talking to them through their standard input and
+/// output: a proof assistant, a REPL, a compiler, a language server.
+///
+/// A plugin may only start programs it has been allowed to. Bundled plugins
+/// are allowed theirs by the host; others are listed in `plugins.toml` in the
+/// user config directory:
+///
+///     [plugins.<plugin file name, without .wasm>]
+///     run = ["coqtop", "lean"]    # or ["*"] for any program
+///
+/// A bare name like "coqtop" allows that program as found on the PATH, and only
+/// when the plugin asks for it by bare name. A path allows exactly that file.
+///
+/// Output arrives later, as `process-output` events, and then one
+/// `process-exited`, delivered only to the plugin that called `spawn`. Writing
+/// never blocks: the host queues the bytes and feeds them to the program.
+interface process {
+    record command {
+        /// The program: a name to look up on the PATH, or a path.
+        program: string,
+        args: list<string>,
+        /// Working directory. None: the directory Arrow was started in.
+        cwd: option<string>,
+        /// Extra environment variables, on top of Arrow's own.
+        env: list<tuple<string, string>>,
+    }
+
+    /// Start a program with its stdin, stdout and stderr connected to this
+    /// plugin. Returns an id for the other functions and for the events.
+    spawn: func(command: command) -> result<u32, string>;
+    /// Queue bytes for the program's standard input.
+    write: func(id: u32, data: list<u8>) -> result<_, string>;
+    /// Close the program's standard input, as end-of-file, once queued bytes
+    /// have been written.
+    close-stdin: func(id: u32);
+    /// Stop the program. Its `process-exited` event still follows.
+    kill: func(id: u32);
+}
+
 /// The host's user interface.
 interface ui {
     use types.{menu, tree-menu, tree-node};
@@ -280,6 +343,7 @@ world plugin {
     import editor;
     import registry;
     import ui;
+    import process;
     use types.{event};
 
     /// Called once when the plugin loads. Register modes, commands, keys and

@@ -12,8 +12,10 @@ use crate::components::keys::{KeyChord, KeyPress};
 use crate::components::menu::{self, Menu};
 use crate::components::text_editor::{Selection, TextEditor};
 use crate::components::tree_menu::{self, TreeMenu};
-use crate::config::user_config_dir;
-use crate::plugins::{Core, Event, EventKind, Lookup, PluginHost};
+use crate::config::{user_cache_dir, user_config_dir};
+use iced::futures::channel::mpsc::UnboundedReceiver;
+
+use crate::plugins::{Core, Event, EventKind, Lookup, PluginHost, ProcessEvent};
 use crate::syntax::{Languages, Syntax};
 
 #[cfg(test)]
@@ -61,6 +63,9 @@ pub struct Session {
     pub(crate) quit: bool,
     /// A `terminal` command ran; the window acts on it.
     pub(crate) terminal_request: Option<TerminalRequest>,
+    /// Output and exits of programs plugins started. The window takes this
+    /// once, streams it, and hands the events back through [`Session::deliver`].
+    pub(crate) process_events: Option<UnboundedReceiver<ProcessEvent>>,
     /// Parses the buffer for highlighting. `None` if tree-sitter couldn't start.
     syntax: Option<Syntax>,
 }
@@ -78,7 +83,12 @@ impl Session {
     /// A session with the bundled plugins, and the user's plugins if asked.
     pub async fn start(text: &str, user_plugins: bool) -> Self {
         let mut core = Core::new(TextEditor::new(text), APP_COMMANDS.to_vec());
-        let mut plugins = PluginHost::new();
+        // Before plugins load, so their `init` can already start programs.
+        let process_events = core.processes.connect();
+        // Compiled plugins are cached for the real app only, so tests don't
+        // write to the user's cache folder.
+        let cache = user_plugins.then(user_cache_dir).flatten().map(|dir| dir.join("plugins"));
+        let mut plugins = PluginHost::new(cache);
         let mut errors = plugins.load_bundled(&mut core).await;
         if user_plugins {
             errors.extend(plugins.load_user_plugins(&mut core).await);
@@ -104,6 +114,7 @@ impl Session {
             awaiting_char: None,
             quit: false,
             terminal_request: None,
+            process_events: Some(process_events),
             syntax,
         };
         session.core.events.push_back(Event::Startup);
@@ -117,6 +128,34 @@ impl Session {
             session.report(error);
         }
         session
+    }
+
+    /// Hand programs' output and exits to the plugins that started them, then
+    /// run whatever that caused, as after a key press.
+    ///
+    /// Unlike other events, these go only to the program's owner, and edits
+    /// made while handling them do cause events: output arrives on its own,
+    /// like a key press, rather than as a reaction to something.
+    pub async fn deliver(&mut self, events: Vec<ProcessEvent>) {
+        for event in events {
+            let id = event.id();
+            // A program whose plugin was disabled has no owner any more.
+            let Some(owner) = self.core.processes.owner(id) else {
+                continue;
+            };
+            let before = self.observe();
+            let result = self.plugins.send_event(owner, &mut self.core, &event.to_event()).await;
+            if let Err(error) = result {
+                self.report(error);
+            }
+            self.emit_changes(before);
+            if let ProcessEvent::Exited { .. } = event {
+                self.core.processes.remove(id);
+            }
+        }
+        self.follow_up().await;
+        self.sync_menus().await;
+        self.update_syntax();
     }
 
     /// Handle key presses in order until one asks the window to do something
@@ -349,6 +388,8 @@ impl Session {
             Event::SelectionChanged(_) => EventKind::SelectionChanged,
             Event::ModeChanged(_) => EventKind::ModeChanged,
             Event::CommandExecuted(_) => EventKind::CommandExecuted,
+            // These go only to the program's owner, by `deliver`, never here.
+            Event::ProcessOutput(_) | Event::ProcessExited(_) => return,
         };
         for plugin in self.core.registry.subscribers(kind) {
             if let Err(error) = self.plugins.send_event(plugin, &mut self.core, event).await {

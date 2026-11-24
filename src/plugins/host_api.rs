@@ -5,7 +5,8 @@ use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use super::registry::PluginCommand;
-use super::{Core, EventKind, host_editor, host_registry, host_ui, types};
+use super::processes::Spawn;
+use super::{Core, EventKind, Programs, host_editor, host_process, host_registry, host_ui, types};
 use crate::components::menu::{MenuItem, MenuSpec};
 use crate::components::text_editor::Selection;
 use crate::components::tree_menu::{TreeNode, TreeSpec};
@@ -17,6 +18,8 @@ pub struct HostState {
     pub(super) plugin: usize,
     /// Epoch ticks the current call may still run for.
     pub(super) ticks_left: u64,
+    /// Programs this plugin may start.
+    pub(super) programs: Programs,
     pub(super) wasi: WasiCtx,
     pub(super) table: ResourceTable,
 }
@@ -303,5 +306,33 @@ impl host_registry::Host for HostState {
                 command: command.to_string(),
             })
             .collect()
+    }
+}
+
+impl host_process::Host for HostState {
+    fn spawn(&mut self, command: host_process::Command) -> Result<u32, String> {
+        let (plugin, programs) = (self.plugin, self.programs.clone());
+        let spawn = Spawn {
+            program: command.program,
+            args: command.args,
+            cwd: command.cwd,
+            env: command.env,
+        };
+        self.core().processes.spawn(plugin, &programs, spawn)
+    }
+
+    fn write(&mut self, id: u32, data: Vec<u8>) -> Result<(), String> {
+        let plugin = self.plugin;
+        self.core().processes.write(plugin, id, data)
+    }
+
+    fn close_stdin(&mut self, id: u32) {
+        let plugin = self.plugin;
+        self.core().processes.close_stdin(plugin, id);
+    }
+
+    fn kill(&mut self, id: u32) {
+        let plugin = self.plugin;
+        self.core().processes.kill(plugin, id);
     }
 }

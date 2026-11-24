@@ -55,6 +55,7 @@ first, then act, and every command acts at every dot at once.
 | `Space b` | switch between open buffers |
 | `Ctrl-s` or `:write` | save the buffer to its file |
 | `Space k` | close the current buffer (refused if it has unsaved changes; `:discard-buffer` closes it anyway) |
+| `Space g` | list the files git reports as changed, and open one |
 | `Ctrl-t` | open the terminal and type into it (in the terminal: back to the editor) |
 | `Alt-t` | show or hide the terminal |
 | `Alt-s`, `Space d`, `Space c` | sort lines, duplicate line, count words (from the text-tools plugin) |
@@ -95,8 +96,13 @@ arrow/
   grammars/<grammar>.wasm           tree-sitter grammars
   queries/<language>/highlights.scm highlight queries
   terminal.toml                     the terminal's shell and height
+  plugins.toml                      which programs each of your plugins may run
   state/terminal.log                the terminal's saved history (kept by Arrow)
 ```
+
+Compiled plugins are cached separately, in `%LOCALAPPDATA%\arrow\cache` on
+Windows or `~/.cache/arrow` elsewhere, so Arrow starts in a few milliseconds
+after its first run. Deleting the cache is always safe; it's rebuilt as needed.
 
 `terminal.toml` is optional:
 
@@ -146,7 +152,9 @@ A plugin is a WebAssembly component for the `plugin` world in
   `"gh"`, `"<a-s>"`, `"<space>d"`);
 - subscribe to events: startup, buffer and selection changes, mode changes,
   and commands run;
-- open menus and tree menus for the user to pick from.
+- open menus and tree menus for the user to pick from;
+- run programs and talk to them through their standard input and output, if
+  the user allows it (see below).
 
 The easiest way to write one is Rust with
 [`wit-bindgen`](https://github.com/bytecodealliance/wit-bindgen), as the
@@ -159,6 +167,29 @@ it but stdout and stderr (the bundled file manager also gets read-only access
 to the folder Arrow was started in). A plugin call that runs for more than
 about half a second is stopped, and a plugin that crashes or times out is
 disabled without taking the editor down.
+
+### Running programs
+
+The `process` interface lets a plugin start a program, such as a proof
+assistant, a REPL or a compiler, write to its standard input, and receive its
+output. `spawn` returns an id straight away. The output then arrives as
+`process-output` events, followed by one `process-exited`, sent only to the
+plugin that started the program. Writing never blocks the editor.
+
+Because running a program reaches outside the sandbox, a plugin may only start
+the programs you allow, in `plugins.toml` in the config folder:
+
+```toml
+[plugins.proof]          # the plugin's file name, without .wasm
+run = ["coqtop"]         # programs it may start; ["*"] allows any
+```
+
+A bare name like `coqtop` allows that program as found on your PATH, and only
+when the plugin asks for it by bare name. A path allows exactly that file. A
+plugin that is disabled after a crash has its programs stopped.
+
+[`plugins/git`](plugins/git) is a small example: `Space g` runs `git status`
+and lists the changed files in a menu to open.
 
 ## How it's built
 

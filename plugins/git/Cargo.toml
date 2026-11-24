@@ -1,0 +1,12 @@
+[package]
+name = "git"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "git status in a menu for Arrow: the example user of the process API."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.63.0"

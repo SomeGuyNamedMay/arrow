@@ -577,6 +577,66 @@ fn undo_on_a_large_buffer_restores_it_exactly() {
     assert!(text(&app).ends_with("done\n"));
 }
 
+// ----- Programs plugins run -----
+
+/// Play the window's part for programs' output: hand whatever has arrived to
+/// the session, until `done` or a timeout.
+fn deliver_until(app: &mut App, done: impl Fn(&App) -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(20) {
+        let mut events = Vec::new();
+        while let Ok(event) = app.process_events.as_mut().unwrap().try_recv() {
+            events.push(event);
+        }
+        if !events.is_empty() {
+            block_on(app.deliver(events));
+        }
+        if done(app) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// Removes a file when dropped, even if the test fails.
+struct RemoveOnDrop(&'static str);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+#[test]
+fn the_git_plugin_runs_git_and_opens_a_changed_file() {
+    if std::process::Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git isn't installed; skipping");
+        return;
+    }
+    // An untracked file, so there's a change to list however clean the
+    // checkout is. (`target/` is ignored by git, so it has to be at the top.)
+    let marker = "arrow-git-plugin-test.tmp";
+    std::fs::write(marker, "marked\n").unwrap();
+    let _remove = RemoveOnDrop(marker);
+
+    let mut app = app("");
+    type_keys(&mut app, "<space>g");
+    // The command returns at once; git's output arrives afterwards.
+    assert_eq!(message(&app), "git status…");
+    assert!(deliver_until(&mut app, |app| app.menu.is_open()), "{}", message(&app));
+    let item = menu_item(&app, marker);
+    assert_eq!((item.annotation.as_str(), item.detail.as_str()), ("??", "untracked"));
+    // Its program is forgotten once it has exited.
+    assert!(app.core.processes.owner(1).is_none());
+
+    // Choosing it opens the file, through the files plugin's command.
+    type_keys(&mut app, marker);
+    type_keys(&mut app, "<ret>");
+    assert_eq!(app.core.editor.editor().name(), marker);
+    assert_eq!(text(&app), "marked\n");
+}
+
 // ----- The terminal (owned by the window; the session only asks for it) -----
 
 fn keys(keys: &str) -> Vec<KeyPress> {

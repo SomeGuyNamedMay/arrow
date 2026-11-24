@@ -10,6 +10,7 @@ const BUNDLED: &[(&str, &str)] = &[
     ("arrow-core", "core"),
     ("text-tools", "text-tools"),
     ("files", "files"),
+    ("git", "git"),
 ];
 
 fn main() {

@@ -14,3 +14,18 @@ pub fn user_config_dir() -> Option<PathBuf> {
     };
     config.map(|dir| dir.join("arrow"))
 }
+
+/// Where Arrow keeps things it can rebuild, like compiled plugins:
+/// `%LOCALAPPDATA%\arrow\cache` on Windows (local, so it doesn't roam with
+/// the user's profile), `$XDG_CACHE_HOME/arrow` or `~/.cache/arrow` elsewhere.
+pub fn user_cache_dir() -> Option<PathBuf> {
+    let cache = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("arrow").join("cache"))
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .map(|dir| dir.join("arrow"))
+    };
+    cache
+}

@@ -89,6 +89,8 @@ impl Guest for TextTools {
                     stats.commands += 1;
                     stats.last_command = Some(name);
                 }
+                // Output from programs, which this plugin doesn't run.
+                _ => {}
             }
         });
     }
